@@ -1,0 +1,11 @@
+opencv-python
+numpy
+pyautogui
+pynput
+pyyaml
+PySide6
+ruamel.yaml
+pywin32; sys_platform == "win32"
+windows-capture ; sys_platform == "win32"
+openvino==2026.3.0; sys_platform == "win32"
+pyobjc-framework-Quartz ; sys_platform == "darwin" # TODO: dev macOS in another branch

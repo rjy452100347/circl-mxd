@@ -1,0 +1,64 @@
+bot:
+  map: newcomer_training_ground_1
+  route_attack: true
+  route_only: true
+directional_attack:
+  range_x: 100
+  range_y: 100
+edge_teleport:
+  enable: false
+game_window:
+  client_crop:
+  - 1
+  - 48
+  - 1
+  - 0
+  debug_size:
+  - 768
+  - 1366
+  resize_on_start: false
+  size:
+  - 1152
+  - 2049
+  title: "\u5192\u9669\u5C9B\u6000\u65E7\u670D"
+  title_bar_height: 0
+health_monitor:
+  add_hp_percent: 60
+  add_mp_percent: 0
+  enable: false
+key:
+  add_hp: f
+  aoe_skill: '1'
+  directional_attack: q
+  jump: '1'
+  return_home: '2'
+  teleport: '2'
+minimap:
+  player_hsv:
+    lower:
+    - 20
+    - 100
+    - 120
+    upper:
+    - 40
+    - 255
+    - 255
+  roi:
+  - 0.0034163006
+  - 0.0902777778
+  - 0.1078574915
+  - 0.1623263889
+route:
+  event_rearm_distance: 5
+  localization_max_score: 0.2
+  mount_horizontal_tolerance: 6
+  mount_press_duration: 0.1
+  mount_retry_frames: 5
+  mount_search_range: 10
+  mount_success_distance: 12
+  search_range: 15
+  visual_recovery_timeout: 90.0
+ui_coords:
+  ui_y_start: 915
+watchdog:
+  enable: false

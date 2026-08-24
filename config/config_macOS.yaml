@@ -1,0 +1,8 @@
+# macOS display/capture overrides. Runtime timing remains internal.
+game_window:
+  size: [691, 1280]
+  title_bar_height: 85
+minimap:
+  player_color: [84, 255, 255]
+  other_player_color: [20, 15, 228]
+  debug_window_upscale: 2

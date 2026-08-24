@@ -1,0 +1,109 @@
+bot:
+  mode: normal # Options: "normal" "aux" "patrol"
+  attack: directional # Options: "directional" "aoe_skill"
+  route_attack: false
+  map: ''
+key:
+  aoe_skill: q
+  directional_attack: w
+  teleport: e
+  jump: space
+  add_hp: '1'
+  add_mp: '2'
+  return_home: home
+directional_attack:
+  range_x: 350
+  range_y: 70
+  cooldown: 0.9
+  character_turn_delay: 0.02
+aoe_skill:
+  range_x: 400
+  range_y: 170
+  cooldown: 0.05
+health_monitor:
+  enable: true
+  force_heal: false
+  add_hp_percent: 50
+  add_mp_percent: 50
+  add_hp_cooldown: 0.5
+  add_mp_cooldown: 0.5
+  fps_limit: 20
+  return_home_if_no_potion: false
+  return_home_watch_dog_timeout: 3
+teleport:
+  is_use_teleport_to_walk: false
+  cooldown: 1
+edge_teleport:
+  enable: true
+  trigger_box_width: 20
+  trigger_box_height: 10
+  color_code: [255, 127, 127]
+nametag:
+  name: classic_cn_player
+monster_detect:
+  openvino_deployment_root: deployment/openvino_cpu_2class
+  yolo_variant: int8_v2 # Options: "int8_v2" "fp16" "int8"
+  yolo_confidence: 0.60
+  yolo_max_det: 50
+combat_tracking:
+  pursuit_vertical_tolerance: 70
+  target_lost_grace_seconds: 0.3
+channel_change:
+  enable: false
+  mode: pixel # Options: "true" "pixel"
+  other_player_move_thres: 10
+scheduled_channel_switching:
+  enable: false
+  interval_seconds: 1800
+ui_coords:
+  ui_y_start: 610
+  menu: [1140, 730]
+  channel: [1140, 666]
+  random_channel: [877, 161]
+  random_channel_confirm: [585, 420]
+  select_character: [888, 275]
+  login_button_thres: 0.05
+  login_button_top_left: [838, 317]
+  login_button_bottom_right: [940, 373]
+route:
+  search_range: 10
+  jump_down_cooldown: 3.0
+  traversal_commit_seconds: 0.45
+  color_code:
+    "255,0,0": "left none none"
+    "0,0,255": "right none none"
+    "255,127,0": "left none jump"
+    "0,255,255": "right none jump"
+    "127,255,0": "none down jump"
+    "255,0,255": "none none jump"
+    "0,255,127": "stop stop stop"
+    "255,255,0": "none none goal"
+    "255,0,127": "none up teleport"
+    "127,0,255": "none down teleport"
+    "0,127,0": "left none teleport"
+    "139,69,19": "right none teleport"
+  color_code_up_down:
+    "127,127,127": "none up none"
+    "255,255,127": "none down none"
+watchdog:
+  range: 10
+  timeout: 10
+  last_attack_timeout: 1200
+  last_attack_timeout_action: change_channel # Options: "go_home" "change_channel"
+minimap:
+  player_color: [136, 255, 255]
+  other_player_color: [0, 0, 255]
+  debug_window_upscale: 4
+  offset: [0, 0]
+patrol:
+  range: [0.2, 0.8]
+  turn_point_thres: 10
+  patrol_attack_interval: 2.5
+game_window:
+  title: MapleStory Worlds
+  size: [693, 1282]
+  ratio_tolerance: 0.08
+  title_bar_height: 59
+profiler:
+  enable: false
+  print_frequency: 30
