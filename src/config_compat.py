@@ -58,3 +58,50 @@ def validate_custom_config(config):
     if paths:
         raise ConfigCompatibilityError(paths)
     return config
+
+
+def migrate_health_monitor_config(config):
+    """Normalize the legacy global health switch into per-resource switches."""
+    if not isinstance(config, dict):
+        return config
+    health = config.get("health_monitor")
+    if not isinstance(health, dict):
+        return config
+    has_legacy_switch = "enable" in health
+    legacy_value = health.get("enable", True)
+    # YAML booleans must remain booleans.  Treat malformed strings such as
+    # "false" as disabled rather than Python's truthy string value.
+    legacy_enabled = legacy_value is True
+
+    def threshold_is_enabled(key):
+        try:
+            return float(health[key]) > 0
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    for kind in ("hp", "mp"):
+        enabled_key = f"auto_{kind}_enabled"
+        threshold_key = f"add_{kind}_percent"
+        if enabled_key in health:
+            if not isinstance(health[enabled_key], bool):
+                raise ValueError(
+                    f"health_monitor.{enabled_key} 必须是布尔值 true/false。"
+                )
+            continue
+        if has_legacy_switch:
+            # An explicit old global switch applies to both resources.  If the
+            # old profile omitted one threshold, keep the enabled state so the
+            # merged default threshold remains effective.
+            health[enabled_key] = (
+                legacy_enabled and (
+                    threshold_key not in health or
+                    threshold_is_enabled(threshold_key)
+                )
+            )
+        elif threshold_key in health:
+            # Partial legacy profiles commonly override HP only.  Migrate only
+            # fields they actually own; omitted fields must still inherit the
+            # current base profile during override_cfg().
+            health[enabled_key] = threshold_is_enabled(threshold_key)
+    health.pop("enable", None)
+    return config

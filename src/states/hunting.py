@@ -1,4 +1,5 @@
 from src.states.base_state import State
+from src.engine.FullscreenSelfDetector import uses_fullscreen_self
 
 class HuntingState(State):
     def on_enter(self):
@@ -24,6 +25,8 @@ class HuntingState(State):
         if self.bot.is_player_stuck():
             self.bot.update_cmd_by_random()
 
+        if uses_fullscreen_self(self.bot.cfg) and not self.bot.fullscreen_control_ready():
+            return
         # send command to keyboard controller
         self.bot.kb.set_command(self.bot.cmd_move_x + ' ' + \
                                 self.bot.cmd_move_y + ' ' + \

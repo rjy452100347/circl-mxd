@@ -16,6 +16,19 @@ def test_critical_route_action_has_exclusive_control():
     assert result.owner == "route_critical"
 
 
+def test_semantic_ladder_alignment_is_exclusive_before_mount():
+    arbiter = RouteCombatArbiter()
+    route = RouteIntent(
+        "right", "none", "none", "semantic_ladder_coarse_align"
+    )
+    combat = CombatIntent("visible_attack", "left", "attack_left")
+
+    result = arbiter.resolve(route, combat)
+
+    assert result.command == "right none none"
+    assert result.owner == "route_critical"
+
+
 def test_pursuit_overrides_only_horizontal_route_cruise():
     arbiter = RouteCombatArbiter()
     route = RouteIntent("right", "none", "none")

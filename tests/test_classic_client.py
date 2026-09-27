@@ -29,6 +29,7 @@ def test_current_client_frame_is_not_cropped_or_resized():
 
     assert prepared.shape == (1152, 2049, 3)
     assert prepared is not frame
+    assert np.shares_memory(prepared, frame)
 
 
 def test_current_client_wrong_size_is_rejected():
@@ -38,7 +39,10 @@ def test_current_client_wrong_size_is_rejected():
 def test_normalized_minimap_roi_matches_verified_client_geometry():
     frame = np.zeros((1152, 2049, 3), dtype=np.uint8)
 
-    assert get_minimap_loc_size(frame, _cfg()) == (7, 104, 221, 187)
+    from src.engine.MapProjectConfig import normalized_roi_to_pixels
+    assert normalized_roi_to_pixels(_cfg()['minimap']['roi'], 2049, 1152) == (7, 104, 221, 187)
+    # Legal coordinates are not evidence of a visible minimap.
+    assert get_minimap_loc_size(frame, _cfg()) is None
 
 
 def test_player_hsv_detection_accepts_current_yellow_marker():

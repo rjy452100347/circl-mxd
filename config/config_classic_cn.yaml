@@ -1,12 +1,17 @@
 bot:
-  map: newcomer_training_ground_1
+  map: 'your_map_id'
+  mode: fixed_platform
   route_attack: true
   route_only: true
+channel_change:
+  mode: 'true'
 directional_attack:
   range_x: 100
   range_y: 100
 edge_teleport:
   enable: false
+fixed_platform:
+  width_px: 100
 game_window:
   client_crop:
   - 1
@@ -25,22 +30,22 @@ game_window:
 health_monitor:
   add_hp_percent: 60
   add_mp_percent: 0
-  enable: false
+  auto_mp_enabled: false
 key:
   add_hp: f
   aoe_skill: '1'
   directional_attack: q
-  jump: '1'
+  jump: space
   return_home: '2'
-  teleport: '2'
+  teleport: ''
 minimap:
   player_hsv:
     lower:
-    - 20
-    - 100
-    - 120
+    - 27
+    - 140
+    - 220
     upper:
-    - 40
+    - 34
     - 255
     - 255
   roi:
@@ -48,6 +53,22 @@ minimap:
   - 0.0902777778
   - 0.1078574915
   - 0.1623263889
+monster_detect:
+  openvino_deployment_root: deployment/warrior_v3_openvino_int8
+  yolo_confidence: 0.7
+  yolo_content_scale: 0.7
+  yolo_max_det: 300
+  yolo_min_monster_box_side: 15
+  yolo_player_confidence: 0.25
+  yolo_self_confidence: 0.69
+  yolo_variant: int8_head_fp
+  yolo_view_crop:
+  - 4
+  - 0
+  - 5
+  - 117
+nametag:
+  name: w15
 route:
   event_rearm_distance: 5
   localization_max_score: 0.2

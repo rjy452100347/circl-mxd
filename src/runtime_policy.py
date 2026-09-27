@@ -19,6 +19,8 @@ class RuntimePolicy:
     route_recorder_fps: int = 10
     route_recorder_blob_cooldown: float = 0.7
     route_recorder_map_padding: int = 30
+    preview_fps: int = 5
+    preview_max_width: int = 1280
     auto_dice_fps: int = 1
     client_language: str = "cn"
     yolo_input_width: int = 1280

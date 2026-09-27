@@ -2,6 +2,7 @@ import time
 
 # Local import
 from src.states.base_state import State
+from src.engine.FullscreenSelfDetector import uses_fullscreen_self
 
 class PatrolState(State):
     def __init__(self, name, bot):
@@ -45,8 +46,8 @@ class PatrolState(State):
         self.bot.update_cmd_by_mob_detection()
 
         # Update attack commend by periodically attack
-        if time.time() - self.bot.t_last_attack > \
-            self.bot.cfg["patrol"]["patrol_attack_interval"]:
+        if (not uses_fullscreen_self(self.bot.cfg) and
+                time.time() - self.bot.t_last_attack > self.bot.cfg["patrol"]["patrol_attack_interval"]):
             self.bot.cmd_action = "attack"
             self.bot.t_last_attack = time.time()
 
@@ -54,6 +55,8 @@ class PatrolState(State):
         if self.bot.is_player_stuck():
             self.bot.update_cmd_by_random()
 
+        if uses_fullscreen_self(self.bot.cfg) and not self.bot.fullscreen_control_ready():
+            return
         # send command to keyboard controller
         self.bot.kb.set_command(self.bot.cmd_move_x + ' ' + \
                                 self.bot.cmd_move_y + ' ' + \

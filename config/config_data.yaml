@@ -1,6 +1,7 @@
 # Translation from English to Chinese
 eng_to_cn:
   # map
+  "测试2": "测试2"
   newcomer_training_ground_1: "射手训练场 I"
   ant_cave_2: 螞蟻洞2
   cloud_balcony: 雲彩露臺

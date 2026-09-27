@@ -3,9 +3,11 @@ Utility functions
 '''
 # Standard Import
 import cv2
+import copy
 import datetime
 import os
 import platform
+import tempfile
 from collections import defaultdict
 import time
 
@@ -67,9 +69,40 @@ def load_yaml_with_comments(path):
     return data, dict(field_comments), section_comments
 
 def save_yaml(data, path):
+    """Serialize YAML completely before atomically replacing *path*.
+
+    The main window and a second accidentally opened instance can save the
+    shared runtime snapshot at nearly the same time.  Writing the destination
+    directly lets another process parse a truncated document.  A same-folder
+    temporary file plus ``os.replace`` keeps every observable version whole.
+    """
     data = convert_tuples_to_lists(data)
-    with open(path, 'w', encoding='utf-8') as f:
-        yaml.dump(data, f, default_flow_style=False)
+    target = os.fspath(path)
+    parent = os.path.dirname(os.path.abspath(target))
+    os.makedirs(parent, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=parent
+    )
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as f:
+            yaml.dump(data, f, default_flow_style=False)
+            f.flush()
+            os.fsync(f.fileno())
+        # Validate exactly what will become visible.  A serialization failure
+        # therefore leaves the previous configuration untouched.
+        with open(temporary, 'r', encoding='utf-8') as f:
+            yaml.safe_load(f)
+        for attempt in range(3):
+            try:
+                os.replace(temporary, target)
+                break
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.02)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     logger.info(f"Save yaml: {path}")
 
 def get_cfg_diff(base, current):
@@ -91,6 +124,33 @@ def get_cfg_diff(base, current):
             if norm_current != norm_base:
                 diff[key] = current[key]
     return diff
+
+
+def retain_explicit_config_values(diff, current, explicit):
+    """Keep fields that the loaded profile deliberately declared.
+
+    ``get_cfg_diff`` omits values equal to the generic defaults.  Some client
+    profiles still need those values written explicitly as part of their
+    contract (for example the classic client's jump key).  Removed/migrated
+    fields are not restored because they no longer exist in ``current``.
+    """
+    result = copy.deepcopy(diff)
+    if not isinstance(current, dict) or not isinstance(explicit, dict):
+        return result
+    for key, explicit_value in explicit.items():
+        if key not in current:
+            continue
+        current_value = current[key]
+        if isinstance(explicit_value, dict) and isinstance(current_value, dict):
+            child = result.get(key, {})
+            result[key] = retain_explicit_config_values(
+                child, current_value, explicit_value
+            )
+            if not result[key]:
+                result.pop(key, None)
+        else:
+            result[key] = copy.deepcopy(current_value)
+    return result
 
 def normalize(value):
     """
@@ -148,8 +208,15 @@ def load_image(path, mode=cv2.IMREAD_COLOR):
         logger.error(f"Image not found: {path}")
         raise FileNotFoundError(f"Image not found: {path}")
 
-    # Load image
-    img = cv2.imread(path, mode)
+    # ``cv2.imread`` is not reliable for non-ASCII Windows paths. Reading the
+    # bytes through NumPy and decoding them keeps Chinese map/profile names
+    # working without changing callers or image ownership.
+    try:
+        encoded = np.fromfile(path, dtype=np.uint8)
+    except OSError as exc:
+        logger.error(f"Failed to read image file: {path}: {exc}")
+        raise ValueError(f"Failed to load image: {path}") from exc
+    img = cv2.imdecode(encoded, mode) if encoded.size else None
     if img is None:
         logger.error(f"Failed to load image file: {path}")
         raise ValueError(f"Failed to load image: {path}")
@@ -293,7 +360,9 @@ def find_pattern_sqdiff(
         last_result=None,
         mask=None,
         local_search_radius=50,
-        global_threshold=0.4
+        global_threshold=0.4,
+        search_mode="auto",
+        return_margin=False,
     ):
     '''
     Perform masked template matching using SQDIFF_NORMED method.
@@ -311,12 +380,33 @@ def find_pattern_sqdiff(
     - min_val: The matching score (lower = better for SQDIFF_NORMED).
     - bool: local search success or not
     '''
+    if search_mode not in {"auto", "local", "global"}:
+        raise ValueError("Invalid minimap search mode")
+    if search_mode != "auto" and (mask is not None and np.count_nonzero(mask) < 64):
+        return ((0, 0), float('inf'), False, 0.0) if return_margin else ((0, 0), float('inf'), False)
+    if search_mode != "auto":
+        gray = cv2.cvtColor(img_pattern, cv2.COLOR_BGR2GRAY) if img_pattern.ndim == 3 else img_pattern
+        static_pixels = gray[mask != 0] if mask is not None else gray.ravel()
+        if static_pixels.size < 64 or float(np.std(static_pixels)) < 3:
+            return ((0, 0), float('inf'), False, 0.0) if return_margin else ((0, 0), float('inf'), False)
+
+    def result_at(res, origin, local):
+        res = np.nan_to_num(res, nan=float('inf'), posinf=float('inf'), neginf=float('inf'))
+        value, _, loc, _ = cv2.minMaxLoc(res)
+        if return_margin:
+            alternative = res.copy()
+            px, py = loc
+            alternative[max(0, py-3):py+4, max(0, px-3):px+4] = float('inf')
+            second = float(np.min(alternative))
+            return (origin[0]+loc[0], origin[1]+loc[1]), value, local, second-value
+        return (origin[0]+loc[0], origin[1]+loc[1]), value, local
+
     # Padding if img is smaller than pattern
     img = pad_to_size(img, img_pattern.shape[:2])
 
     # search last result location first to speedup
     h, w = img_pattern.shape[:2]
-    if last_result is not None and global_threshold > 0.0:
+    if last_result is not None and global_threshold > 0.0 and search_mode != "global":
         lx, ly = last_result
         x0 = max(0, lx - local_search_radius)
         y0 = max(0, ly - local_search_radius)
@@ -332,8 +422,10 @@ def find_pattern_sqdiff(
                     mask=mask
             )
             min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-            if min_val < global_threshold:
-                return (x0 + min_loc[0], y0 + min_loc[1]), min_val, True
+            if search_mode == "local" or min_val < global_threshold:
+                return result_at(res, (x0, y0), True)
+    if search_mode == "local":
+        return ((0, 0), float('inf'), True, 0.0) if return_margin else ((0, 0), float('inf'), True)
 
     # Global fallback
     res = cv2.matchTemplate(
@@ -348,7 +440,7 @@ def find_pattern_sqdiff(
 
     min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
 
-    return min_loc, min_val, False
+    return result_at(res, (0, 0), False)
 
 def get_mask(img, ignore_pixel_color):
     '''
@@ -391,148 +483,19 @@ def to_standard_hsv(color_hsv):
     return (h_std, s_std, v_std)
 
 def get_minimap_loc_size(img_frame, cfg=None):
-    '''
-    Detects the location and size of the minimap within the game frame.
+    """Stateless ROI evidence; temporal confirmation belongs to MinimapObserver."""
+    from src.engine.MinimapObservation import inspect_minimap_roi
+    result = inspect_minimap_roi(img_frame, cfg)
+    return result.rect if result.valid else None
 
-    The function works by:
-    - Thresholding the image get pure white(255,255,255) pixels.
-    - Using connected components to find white-bordered regions.
-    - Filtering candidates based on expected minimap size and margin rules:
-        - Top, bottom, left, right margins must be 1px white lines.
-
-    Returns:
-        (x, y, w, h): Top-left coordinate and width/height of the minimap.
-                    Returns None if not found.
-    '''
-    if cfg is not None:
-        normalized = cfg.get("minimap", {}).get("roi")
-        if normalized:
-            if len(normalized) != 4:
-                raise ValueError("minimap.roi must contain x, y, width, height")
-            height, width = img_frame.shape[:2]
-            nx, ny, nw, nh = (float(value) for value in normalized)
-            left = max(0, min(round(nx * width), width))
-            top = max(0, min(round(ny * height), height))
-            right = max(left, min(round((nx + nw) * width), width))
-            bottom = max(top, min(round((ny + nh) * height), height))
-            if right <= left or bottom <= top:
-                return None
-            return left, top, right - left, bottom - top
-
-    white = np.array([255, 255, 255])
-
-    # Mask for pure white
-    mask_white = cv2.inRange(img_frame, white, white)
-
-    # Connected components with stats
-    num_labels, labels, stats, centroids = \
-        cv2.connectedComponentsWithStats(mask_white, connectivity=8)
-
-    # Loop over components (skip label 0, which is background)
-    for i in range(1, num_labels):
-        x0, y0, rw, rh, area = stats[i]
-
-        # Filter out small blobs
-        if rw < 100 or rh < 100:
-            continue
-
-        x1 = x0 + rw - 1
-        y1 = y0 + rh - 1
-
-        # Check 1px white top and bottom margins
-        if not (np.all(img_frame[y0, x0:x0+rw] == white) and \
-                np.all(img_frame[y1, x0:x0+rw] == white)):
-            continue
-
-        # Check 1px white left and right margins
-        # Ensures the candidate region is framed by white borders like the minimap
-        if not (np.all(img_frame[y0:y0+rh, x0] == white) and \
-                np.all(img_frame[y0:y0+rh, x1] == white)):
-            continue
-
-        # Create a mask of non-white pixels
-        mask_minimap = np.any(img_frame[y0:y0+rh, x0:x0+rw] != white, axis=2).astype(np.uint8)
-
-        # Find bounding box of mask_minimap
-        coords = cv2.findNonZero(mask_minimap)
-        if coords is None:
-            continue  # skip empty block
-        x_minimap, y_minimap, w_minimap, h_minimap = cv2.boundingRect(coords)
-
-        # Offset by original x0, y0 to get coords in original image
-        x_minimap += x0
-        y_minimap += y0
-
-        return x_minimap, y_minimap, w_minimap, h_minimap
-
-    # logger.warning("Minimap not found in the game frame.")
-    return None  # minimap not found
 
 def get_player_location_on_minimap(
-        img_minimap,
-        minimap_player_color=(136, 255, 255),
-        player_hsv=None):
-    """
-    Detects the player's position on the minimap.
-
-    The function works by:
-    - Creating a binary mask of all pixels in the minimap that match the configured
-    player color exactly.
-    - Verifying that at least 4 matching pixels are found (to avoid false positives).
-    - Computing the average of these pixel coordinates to determine the center of
-    the player icon on the minimap.
-
-    Returns:
-        (x, y): The player's location in minimap coordinates as a tuple.
-                Returns None if not enough matching pixels are found.
-    """
-    if player_hsv:
-        hsv = cv2.cvtColor(img_minimap, cv2.COLOR_BGR2HSV)
-        lower = np.asarray(player_hsv["lower"], dtype=np.uint8)
-        upper = np.asarray(player_hsv["upper"], dtype=np.uint8)
-        mask = cv2.inRange(hsv, lower, upper)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        count, _labels, stats, centroids = cv2.connectedComponentsWithStats(mask)
-        candidates = []
-        for index in range(1, count):
-            _x, _y, width, height, area = (int(value) for value in stats[index])
-            aspect = width / max(height, 1)
-            if 3 <= area <= 120 and width <= 12 and height <= 12 and 0.60 <= aspect <= 1.67:
-                compactness = area / max(width * height, 1)
-                component_hsv = hsv[_labels == index]
-                saturation = float(component_hsv[:, 1].mean()) / 255.0
-                brightness = float(component_hsv[:, 2].mean()) / 255.0
-                aspect_score = min(aspect, 1.0 / aspect)
-                hue_center = (float(lower[0]) + float(upper[0])) / 2.0
-                hue_half_width = max(1.0, (float(upper[0]) - float(lower[0])) / 2.0)
-                hue_score = max(
-                    0.0,
-                    1.0 - abs(float(component_hsv[:, 0].mean()) - hue_center) / hue_half_width,
-                )
-                score = (
-                    min(area / 36.0, 1.0) * 0.10
-                    + min(compactness / 0.70, 1.0) * 0.15
-                    + aspect_score * 0.25
-                    + saturation * 0.15
-                    + brightness * 0.15
-                    + hue_score * 0.20
-                )
-                candidates.append((score, index))
-        if not candidates:
-            return None
-        candidates.sort(reverse=True)
-        if len(candidates) > 1 and candidates[0][0] - candidates[1][0] < 0.04:
-            return None
-        _score, index = candidates[0]
-        cx, cy = centroids[index]
-        return int(round(cx)), int(round(cy))
-
-    mask = cv2.inRange(img_minimap, minimap_player_color, minimap_player_color)
-    coords = cv2.findNonZero(mask)
-    if coords is None or len(coords) < 4:
-        return None
-    avg = coords.mean(axis=0)[0]
-    return int(round(avg[0])), int(round(avg[1]))
+        img_minimap, minimap_player_color=(136, 255, 255), player_hsv=None):
+    """Select one connected component; never average disconnected players."""
+    from src.engine.MinimapObservation import player_candidates, select_player_candidate
+    candidates, _ = player_candidates(img_minimap, minimap_player_color, player_hsv)
+    point, _ = select_player_candidate(candidates)
+    return point
 
 
 def prepare_game_frame(frame, cfg):
@@ -566,7 +529,10 @@ def prepare_game_frame(frame, cfg):
     if game_window.get("resize_on_start", True):
         return cv2.resize(frame_no_title, WINDOW_WORKING_SIZE,
                           interpolation=cv2.INTER_NEAREST)
-    return frame_no_title.copy()
+    # The capture object owns this frame until the next get_frame() call.  A
+    # view is sufficient for the synchronous control pass and avoids copying
+    # the complete client when no resize is requested.
+    return frame_no_title
 
 def get_all_other_player_locations_on_minimap(img_minimap, red_bgr=(0, 0, 255)):
     '''
@@ -825,10 +791,16 @@ def get_game_window_title_by_token(token):
     '''
     Only work in Windows OS
     '''
+    target = get_game_window_target_by_token(token)
+    return target[1] if target is not None else None
+
+
+def get_game_window_target_by_token(token):
+    """Return the HWND and exact title from one Windows enumeration pass."""
     def callback(hwnd, matches):
         title = win32gui.GetWindowText(hwnd)
         if token.lower() in title.lower():
-            matches.append(title)
+            matches.append((int(hwnd), title))
     matches = []
     win32gui.EnumWindows(callback, matches)
     return matches[0] if matches else None

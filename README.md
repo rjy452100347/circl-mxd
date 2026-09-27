@@ -3,7 +3,7 @@
 这是一个基于屏幕捕获、计算机视觉和模拟键盘输入的 Windows 桌面辅助程序。
 
 > 使用自动化程序可能违反游戏或平台规则，并可能导致账号受限或封禁。请只在获得明确许可的测试环境中使用。项目不读取游戏内存，不提供反作弊绕过，也不保证适用于任何具体服务器或客户端版本。
-## 当前版本展示（仅测试战士，远程职业效果更好）
+## 历史界面演示（录制于旧版本）
 ![主界面演示](docs/output.gif)
 
 ![运行演示](docs/output2.gif)
@@ -12,11 +12,11 @@
 ## 这个版本包含什么
 
 - 简体中文主界面和高级设置；
-- `normal`、`aux`、`patrol` 三种运行模式；
-- 基于名字样本的人物画面定位；
-- OpenVINO 双类别 `monster/player` YOLO 检测；
-- 旧版小地图路线执行、攻击、血蓝监控和换线逻辑；
-- 名字样本标定器和路线录制器。
+- `normal`、`aux`、`patrol`、固定平台及持续攻击运行模式；
+- `warrior_v3` OpenVINO `int8_head_fp` 三分类全屏检测：`monster`、`player`、`self`；
+- 使用 `self` 框定位人物，寻找同层可达怪物并定向攻击；
+- 小地图巡逻、路线录制、ROI 校准、血蓝监控和状态诊断；
+- 保留旧双分类模型与名字样本定位流程的兼容能力。
 
 ## 环境要求
 
@@ -48,16 +48,15 @@ python -m pip install pytest
 
 仓库有意排除了所有运行素材。至少需要自行准备：
 
-1. OpenVINO 部署包；
-2. 当前角色的名字定位样本；
-3. 普通路线模式使用的小地图底图和路线图；
-4. 当前客户端的登录按钮模板 `misc/login_button_cn.png`。
+1. OpenVINO 部署包；三分类配置使用 `warrior_v3` 的 `int8_head_fp` 模型；
+2. 普通路线模式使用的小地图底图和路线图；固定平台模式需校准小地图；
+3. 当前客户端的登录按钮模板 `misc/login_button_cn.png`。
 
-完整目录结构、模型契约和制作方法见 [资源准备说明](docs/RESOURCE_SETUP.md)。未准备资源时可以打开主界面，但点击开始或按 F1 会显示缺失资源错误并拒绝启动。
+三分类模式无需名字样本。模型目录结构和输入契约见 [资源准备说明](docs/RESOURCE_SETUP.md)。未准备资源时可以打开主界面，但点击开始或按 F1 会显示缺失资源错误并拒绝启动。
 
 ## 配置
 
-默认配置位于 `config/config_default.yaml`，当前客户端示例差异配置位于 `config/config_classic_cn.yaml`。
+默认配置位于 `config/config_default.yaml`，保留双分类兼容设置；三分类示例位于 `config/config_classic_cn.yaml`，使用相对部署目录 `deployment/warrior_v3_openvino_int8`。请按本机游戏窗口和模型路径调整配置。
 
 
 ## 启动主程序
@@ -69,13 +68,13 @@ python -m src.main
 
 操作方式：
 
-- 在主界面加载配置并确认地图、攻击键和药水键；
+- 在主界面加载三分类配置并确认模型目录、地图、攻击键和药水键；
 - 点击“开始”或按 `F1` 启动；
 - 再按 `F1` 暂停并释放控制键；
 - `Ctrl+Shift+F12` 请求紧急关闭；
 - “窗口监控”和“路线监控”用于观察识别与路线状态。
 
-## 制作名字样本
+## 旧双分类模式的名字样本
 
 先打开目标程序并显示角色，然后运行：
 
@@ -90,7 +89,7 @@ python -m tools.nametagCalibrator --profile classic_cn_player --cfg classic_cn
 ```powershell
 python -m tools.routeRecorder --new_map your_map_id --cfg classic_cn
 ```
-器常用按键：
+录制器常用按键：
 
 - `F1`：开始或暂停录制；
 - `F2`：保存截图；
@@ -102,9 +101,9 @@ python -m tools.routeRecorder --new_map your_map_id --cfg classic_cn
 
 ## 常见错误
 
-- `找不到部署清单`：模型目录缺少 `manifest.json` 或配置路径错误；
-- `找不到活动模型声明`：缺少 `ACTIVE_MODEL.txt`；
-- `缺少 profile.yaml 或 sample_*.png`：需要先做名字标定；
+- `找不到部署清单`：旧双分类模型目录缺少 `manifest.json` 或配置路径错误；
+- `ACTIVE_MODEL.txt 未指向三类模型`：三分类部署目录或活动模型声明不匹配；
+- `缺少 profile.yaml 或 sample_*.png`：仅旧双分类模式需要名字标定；
 - `Image not found: minimaps/.../map.png`：地图底图尚未录制或地图名不一致；
 - `Image not found: misc/login_button_cn.png`：需要从自己的客户端画面裁剪登录按钮模板；
 - 能识别但人物不移动：通常是程序权限低于目标程序，请用管理员 PowerShell 启动；
@@ -119,4 +118,4 @@ python -m tools.routeRecorder --new_map your_map_id --cfg classic_cn
 
 ## 许可证与来源
 
-代码按 [MIT License](LICENSE) 开源，保留原作者 Ken Yu 的版权声明。外部模型、权重、游戏素材和第三方运行时不属于本仓库授权范围，使用者必须自行确认其许可和分发权。详见 [第三方声明](THIRD_PARTY_NOTICES.md) 与 [快照来源说明](OPEN_SOURCE_PROVENANCE.md)。
+代码按 [MIT License](LICENSE) 开源，保留原作者 Ken Yu 的版权声明。外部模型、权重、游戏素材和第三方运行时不属于本仓库授权范围，使用者必须自行确认其许可和分发权。详见 [第三方声明](THIRD_PARTY_NOTICES.md)。

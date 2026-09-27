@@ -1,7 +1,26 @@
 import cv2
 import numpy as np
+from types import SimpleNamespace
 
-from src.engine.NameTagLocalizer import NameTagLocalizer
+from src.engine.MapleStoryAutoLevelUp import MapleStoryAutoBot
+from src.engine.NameTagLocalizer import NameTagLocalizer, name_search_y_limit
+
+
+def test_automatic_name_search_includes_bottom_independently_of_health_roi():
+    tag = _tag()
+    frame = _frame(tag, (80, 145))
+    cfg = {"nametag": {"search_y_limit": 0}, "ui_coords": {"ui_y_start": 120}}
+    localizer = NameTagLocalizer([(tag, (45, -12))], max_score=.2)
+    assert not localizer.locate(frame, y_limit=120).valid
+    result = localizer.locate(frame, y_limit=name_search_y_limit(cfg, frame.shape[0]))
+    assert result.valid and result.player == (125, 133)
+    assert cfg["ui_coords"]["ui_y_start"] == 120
+
+
+def test_explicit_name_search_limit_remains_respected_and_clipped():
+    assert name_search_y_limit({"nametag": {"search_y_limit": 120}}, 180) == 120
+    assert name_search_y_limit({"nametag": {"search_y_limit": 200}}, 180) == 180
+    assert name_search_y_limit({}, 180) == 180
 
 
 def _tag():
@@ -73,3 +92,117 @@ def test_large_position_jump_requires_two_matching_frames():
     assert first.reason == "jump_unconfirmed"
     assert second.valid
     assert second.tag_top_left == (300, 60)
+
+
+def test_normal_tracking_preprocesses_only_local_roi(monkeypatch):
+    tag = _tag()
+    localizer = NameTagLocalizer(
+        [(tag, (45, -12))], max_score=0.2, local_search_radius=30,
+        global_refresh_frames=30,
+    )
+    assert localizer.locate(_frame(tag, (80, 60))).valid
+
+    calls = []
+    original = cv2.cvtColor
+
+    def recording_cvt_color(image, code):
+        calls.append(image.shape)
+        return original(image, code)
+
+    monkeypatch.setattr(cv2, "cvtColor", recording_cvt_color)
+    result = localizer.locate(_frame(tag, (96, 65)))
+
+    assert result.valid
+    assert calls
+    assert all(shape[0] < 180 and shape[1] < 500 for shape in calls)
+
+
+def test_local_failure_falls_back_to_full_frame_preprocessing(monkeypatch):
+    tag = _tag()
+    localizer = NameTagLocalizer(
+        [(tag, (45, -12))], max_score=0.2, local_search_radius=20,
+        global_refresh_frames=30, max_jump=1000,
+    )
+    assert localizer.locate(_frame(tag, (30, 60))).valid
+
+    calls = []
+    original = cv2.cvtColor
+
+    def recording_cvt_color(image, code):
+        calls.append(image.shape)
+        return original(image, code)
+
+    monkeypatch.setattr(cv2, "cvtColor", recording_cvt_color)
+    result = localizer.locate(_frame(tag, (300, 60)))
+
+    assert result.valid
+    assert any(shape[:2] == (180, 500) for shape in calls)
+    assert any(shape[0] < 180 and shape[1] < 500 for shape in calls)
+
+
+def test_configured_refresh_frame_uses_global_preprocessing(monkeypatch):
+    tag = _tag()
+    localizer = NameTagLocalizer(
+        [(tag, (45, -12))], max_score=0.2,
+        local_search_radius=30, global_refresh_frames=2,
+    )
+    assert localizer.locate(_frame(tag, (80, 60))).valid
+
+    calls = []
+    original = cv2.cvtColor
+
+    def recording_cvt_color(image, code):
+        calls.append(image.shape)
+        return original(image, code)
+
+    monkeypatch.setattr(cv2, "cvtColor", recording_cvt_color)
+    assert localizer.locate(_frame(tag, (82, 60))).valid
+
+    assert calls
+    assert all(shape[:2] == (180, 500) for shape in calls)
+
+
+def test_bot_uses_dedicated_nametag_search_boundary_instead_of_health_ui():
+    bot = object.__new__(MapleStoryAutoBot)
+    bot.img_frame = np.zeros((1200, 500, 3), dtype=np.uint8)
+    bot.img_frame_debug = None
+    bot.cfg = {
+        "nametag": {"search_y_limit": 1040},
+        "ui_coords": {"ui_y_start": 915},
+    }
+    bot.nametag_last_result = None
+    bot.loc_nametag = None
+    received = []
+
+    class Localizer:
+        def locate(self, _frame, *, y_limit):
+            received.append(y_limit)
+            return SimpleNamespace(valid=False)
+
+    bot.nametag_localizer = Localizer()
+
+    assert bot.get_player_location_by_nametag() is None
+    assert received == [1040]
+
+
+def test_bot_nametag_boundary_keeps_legacy_ui_fallback_and_clips_to_frame():
+    bot = object.__new__(MapleStoryAutoBot)
+    bot.img_frame = np.zeros((700, 500, 3), dtype=np.uint8)
+    bot.img_frame_debug = None
+    bot.cfg = {
+        "nametag": {"search_y_limit": 0},
+        "ui_coords": {"ui_y_start": 915},
+    }
+    bot.nametag_last_result = None
+    bot.loc_nametag = None
+    received = []
+
+    class Localizer:
+        def locate(self, _frame, *, y_limit):
+            received.append(y_limit)
+            return SimpleNamespace(valid=False)
+
+    bot.nametag_localizer = Localizer()
+
+    assert bot.get_player_location_by_nametag() is None
+    assert received == [700]

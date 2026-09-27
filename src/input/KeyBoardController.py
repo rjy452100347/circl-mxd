@@ -6,6 +6,8 @@ Simulate user keyboard input to control character in the game
 import threading
 import time
 import ctypes
+import os
+from dataclasses import dataclass
 from ctypes import wintypes
 
 # Library import
@@ -21,8 +23,45 @@ if is_mac():
     import Quartz
 else:
     import pygetwindow as gw
+    import win32api
+    import win32con
+    import win32gui
+    import win32process
+    import win32security
 
 pyautogui.PAUSE = 0  # remove delay
+
+
+def _process_integrity_rid(pid):
+    """Return the Windows mandatory integrity level for a process."""
+    process = win32api.OpenProcess(
+        win32con.PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid)
+    )
+    try:
+        token = win32security.OpenProcessToken(process, win32con.TOKEN_QUERY)
+        try:
+            sid = win32security.GetTokenInformation(
+                token, win32security.TokenIntegrityLevel
+            )[0]
+            return sid.GetSubAuthority(sid.GetSubAuthorityCount() - 1)
+        finally:
+            token.Close()
+    finally:
+        process.Close()
+
+
+def assert_window_input_permission(hwnd):
+    """Fail before control starts if UIPI will block SendInput to the game."""
+    if is_mac() or not hwnd:
+        return
+    _thread_id, target_pid = win32process.GetWindowThreadProcessId(int(hwnd))
+    if not target_pid or not win32gui.IsWindow(int(hwnd)):
+        raise RuntimeError("游戏窗口已关闭，请重新打开游戏后启动助手。")
+    if _process_integrity_rid(target_pid) > _process_integrity_rid(os.getpid()):
+        raise RuntimeError(
+            "游戏以管理员权限运行，助手是普通权限；Windows 会阻止移动和攻击按键。"
+            "请以管理员身份启动助手，或以普通权限重新启动游戏。"
+        )
 
 
 class _KeyboardInput(ctypes.Structure):
@@ -63,8 +102,22 @@ class _Input(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("union", _InputUnion)]
 
 
-_SCAN_CODES = {"left": 0x4B, "right": 0x4D, "up": 0x48, "down": 0x50, "space": 0x39}
-_EXTENDED_KEYS = {"left", "right", "up", "down"}
+_SCAN_CODES = {
+    "left": 0x4B, "right": 0x4D, "up": 0x48, "down": 0x50,
+    "space": 0x39,
+    # Navigation keys use the E0 extended-key flag with these Set-1 scan
+    # codes. QKeySequence may return either the long or abbreviated spelling.
+    "home": 0x47, "end": 0x4F,
+    "pageup": 0x49, "pgup": 0x49,
+    "pagedown": 0x51, "pgdown": 0x51,
+    "insert": 0x52, "ins": 0x52,
+    "delete": 0x53, "del": 0x53,
+}
+_EXTENDED_KEYS = {
+    "left", "right", "up", "down", "home", "end",
+    "pageup", "pgup", "pagedown", "pgdown",
+    "insert", "ins", "delete", "del",
+}
 def _scan_code_for_key(key):
     if key in _SCAN_CODES:
         return _SCAN_CODES[key]
@@ -166,11 +219,21 @@ def press_key(key, duration=0.05):
             # means nothing reached the target window.
             key_up(key)
 
+
+@dataclass(frozen=True)
+class AuxActionRequest:
+    action: str
+    source_sequence: int
+    requested_at: float
+    priority: str = "normal"
+    generation: int = 0
+
 class KeyBoardController():
     '''
     KeyBoardController
     '''
-    def __init__(self, cfg):
+    def __init__(self, cfg, target_window_title=None, target_hwnd=None,
+                 control_disabled=False):
         self.cfg = cfg
         if not is_mac():
             logger.info("[KeyBoardController] Windows input backend: SendInput (fixed)")
@@ -183,12 +246,37 @@ class KeyBoardController():
         self._was_game_window_active = False
         self._foreground_acquired_at = 0.0
         self._command_lock = threading.Lock()
+        self._aux_action_lock = threading.Lock()
+        self._input_state_lock = threading.RLock()
+        self._aux_actions = {}
+        self._aux_generations = {
+            "add_hp": 0,
+            "add_mp": 0,
+            "return_home": 0,
+        }
+        self._aux_last_dispatched = {
+            "add_hp": float("-inf"),
+            "add_mp": float("-inf"),
+            "return_home": float("-inf"),
+        }
         self.command_updated_at = time.monotonic()
         self.command_timeout_seconds = max(
             0.1,
             RUNTIME_POLICY.command_timeout_seconds,
         )
-        self.window_title = cfg["game_window"]["title"]
+        self.aux_action_timeout_seconds = min(
+            0.30, self.command_timeout_seconds
+        )
+        self.window_title = (
+            target_window_title or cfg["game_window"]["title"]
+        )
+        self._window_title_is_exact = bool(target_window_title)
+        self.target_hwnd = int(target_hwnd) if target_hwnd else None
+        self._require_target_hwnd = (
+            not is_mac() and self._window_title_is_exact
+        )
+        if not control_disabled:
+            assert_window_input_permission(self.target_hwnd)
         self.fps = 0 # Frame per seconds
         # Timer
         self.t_last_up = 0.0
@@ -201,6 +289,10 @@ class KeyBoardController():
         self.is_enable = True
         self.is_need_force_heal = False
         self.is_terminated = False
+        # Empty while the controller is running.  A non-empty value explains
+        # a worker-initiated stop to the engine/UI; ordinary pause/close is
+        # tracked by the engine's own termination flag instead.
+        self.termination_reason = ""
         # Parameters
         self.debounce_interval = RUNTIME_POLICY.hotkey_debounce_seconds
         self.fps_limit = RUNTIME_POLICY.keyboard_fps
@@ -226,8 +318,10 @@ class KeyBoardController():
         else:
             raise ValueError(f"Unexpected attack type: {cfg['bot']['attack']}")
 
-        # Start keyboard control thread
-        threading.Thread(target=self.run, daemon=True).start()
+        # Start keyboard control thread and retain ownership so pause/stop can
+        # wait until no old worker is capable of sending another key.
+        self.thread = threading.Thread(target=self.run, daemon=True)
+        self.thread.start()
 
         logger.info("[KeyBoardController] Init done")
 
@@ -235,23 +329,54 @@ class KeyBoardController():
         '''
         toggle_enable
         '''
-        self.is_enable = not self.is_enable
+        with self._input_state_lock:
+            self.is_enable = not self.is_enable
+            self.clear_aux_actions()
+            self.release_all_key()
         logger.info(f"Player pressed F1, is_enable:{self.is_enable}")
-
-        # Make sure all key are released
-        self.release_all_key()
 
     def disable(self):
         '''
         disable keyboard controlller
         '''
-        self.is_enable = False
+        with self._input_state_lock:
+            self.is_enable = False
+            self.clear_aux_actions()
+            self.release_all_key()
 
     def enable(self):
         '''
         enable keyboard controlller
         '''
-        self.is_enable = True
+        with self._input_state_lock:
+            self.clear_aux_actions()
+            self._was_game_window_active = False
+            self.is_enable = True
+
+    def set_force_heal(self, enabled):
+        """Prioritize HP recovery while preserving its configured cooldown."""
+        enabled = bool(enabled)
+        with self._input_state_lock:
+            changed = self.is_need_force_heal != enabled
+            self.is_need_force_heal = enabled
+            if enabled and changed:
+                # MP and ordinary actions must not consume the action cycle
+                # while the character is in the configured HP danger zone.
+                self.clear_aux_actions({"add_mp"})
+
+    def terminate(self):
+        """Atomically close the input gate and release every held key."""
+        with self._input_state_lock:
+            self.is_enable = False
+            self.is_terminated = True
+            self.clear_aux_actions()
+        thread = getattr(self, "thread", None)
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
+            if thread.is_alive():
+                logger.warning("[KeyBoardController] Stop timed out.")
+        with self._input_state_lock:
+            self.release_all_key()
 
     def set_command(self, new_command):
         '''
@@ -273,6 +398,146 @@ class KeyBoardController():
                 self.command_updated_at,
             )
 
+    def request_aux_action(
+        self, action, source_sequence, requested_at=None, priority="normal"
+    ):
+        """Publish one latest recovery request without creating a backlog."""
+        if action not in {"add_hp", "add_mp", "return_home"}:
+            raise ValueError(f"Unsupported auxiliary action: {action}")
+        if priority not in {"normal", "forced", "emergency"}:
+            raise ValueError(f"Unsupported auxiliary priority: {priority}")
+        requested_at = (
+            time.monotonic() if requested_at is None else float(requested_at)
+        )
+        with self._aux_action_lock:
+            if self.is_terminated or not self.is_enable:
+                return False
+            generation = self._aux_generations[action]
+            request = AuxActionRequest(
+                action=action,
+                source_sequence=int(source_sequence),
+                requested_at=requested_at,
+                priority=priority,
+                generation=generation,
+            )
+            previous = self._aux_actions.get(action)
+            if previous is not None and previous.source_sequence >= request.source_sequence:
+                return False
+            self._aux_actions[action] = request
+        return True
+
+    def clear_aux_actions(self, actions=None):
+        if not hasattr(self, "_aux_action_lock"):
+            return
+        with self._aux_action_lock:
+            if actions is None:
+                for action in self._aux_generations:
+                    self._aux_generations[action] += 1
+                self._aux_actions.clear()
+            else:
+                for action in actions:
+                    if action in self._aux_generations:
+                        self._aux_generations[action] += 1
+                    self._aux_actions.pop(action, None)
+
+    def _take_aux_action(self, now_monotonic):
+        if not hasattr(self, "_aux_action_lock"):
+            return None
+        priority_rank = {"normal": 1, "forced": 2, "emergency": 3}
+        action_rank = {"add_mp": 1, "add_hp": 2, "return_home": 3}
+        with self._aux_action_lock:
+            for action, request in list(self._aux_actions.items()):
+                if (request.requested_at <= self._foreground_acquired_at or
+                        now_monotonic - request.requested_at >
+                        getattr(
+                            self, "aux_action_timeout_seconds",
+                            self.command_timeout_seconds,
+                        )):
+                    self._aux_actions.pop(action, None)
+            candidates = sorted(
+                (
+                    request for request in self._aux_actions.values()
+                    if not self.is_need_force_heal or
+                    request.action != "add_mp"
+                ),
+                key=lambda request: (
+                    priority_rank[request.priority], action_rank[request.action]
+                ),
+                reverse=True,
+            )
+            for request in candidates:
+                if request.action == "add_hp":
+                    cooldown = float(
+                        self.cfg["health_monitor"]["add_hp_cooldown"]
+                    )
+                elif request.action == "add_mp":
+                    cooldown = float(
+                        self.cfg["health_monitor"]["add_mp_cooldown"]
+                    )
+                else:
+                    cooldown = 0.0
+                if (now_monotonic - self._aux_last_dispatched[request.action] <
+                        cooldown):
+                    continue
+                self._aux_actions.pop(request.action, None)
+                return request
+        return None
+
+    def recovery_status(self, action, now_monotonic):
+        """Read-only diagnostics; never dequeue or inject input from the UI."""
+        if self.is_terminated or not self.is_enable:
+            return "输入已暂停"
+        if not self.is_game_window_active():
+            return "游戏未获得焦点，禁止按键"
+        with self._aux_action_lock:
+            last = self._aux_last_dispatched.get(action, float("-inf"))
+            pending = self._aux_actions.get(action)
+        cooldown = float(self.cfg["health_monitor"].get(f"{action}_cooldown", 0))
+        remaining = max(0.0, cooldown - (now_monotonic - last))
+        if now_monotonic - last <= .30:
+            return "已发送补药键（不代表游戏已喝药）"
+        if remaining > 0:
+            return f"等待冷却，剩余 {remaining:.1f} 秒"
+        if pending is not None:
+            return "补药请求等待输入安全检查"
+        return "等待新的有效补药请求"
+
+    def _dispatch_aux_action(self, request, now_monotonic):
+        lock = getattr(self, "_input_state_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._input_state_lock = lock
+        with lock:
+            with self._aux_action_lock:
+                generations = getattr(self, "_aux_generations", {})
+                if request.generation != generations.get(request.action, 0):
+                    return False
+                # Re-check immediately beside SendInput.  A pause, recovery,
+                # or focus change after dequeue must fail closed.
+                if (self.is_terminated or not self.is_enable or
+                        not self.is_game_window_active()):
+                    return False
+                # Input-lock waits can outlive the dequeue-time freshness test.
+                if (time.monotonic() - request.requested_at > min(
+                        .30, getattr(self, "aux_action_timeout_seconds", .30))):
+                    return False
+                key = self.cfg["key"][request.action]
+                if request.action == "return_home":
+                    self.release_all_key()
+                press_key(key)
+                dispatched_at = time.monotonic()
+                self._aux_last_dispatched[request.action] = dispatched_at
+                if request.action == "return_home":
+                    self.termination_reason = "return_home"
+                    self.is_enable = False
+                    self.is_terminated = True
+        logger.info(
+            f"[RecoveryInput] action={request.action} key={key} "
+            f"sequence={request.source_sequence} priority={request.priority} "
+            "已发送按键；不代表游戏已喝药"
+        )
+        return True
+
     def press_directional_attack(self, direction, route_direction=None):
         """Briefly face a mob, attack, then restore route movement."""
         if route_direction is None:
@@ -287,18 +552,24 @@ class KeyBoardController():
                 time.sleep(float(self.cfg["directional_attack"].get(
                     "character_turn_delay", 0.02)))
 
+            if (self.is_terminated or not self.is_enable or
+                    not self.is_game_window_active()):
+                return
+
+            press_key(self.attack_key)
             logger.info(
                 f"[AttackInput] key={self.attack_key} face={direction} "
-                f"route={route_direction}"
+                f"route={route_direction} 已发送按键；不代表游戏已执行攻击"
             )
-            press_key(self.attack_key)
             attack_completed = True
         finally:
             if needs_turn:
                 try:
                     key_up(direction)
                 finally:
-                    if attack_completed and route_direction in {"left", "right"}:
+                    if (attack_completed and not self.is_terminated and
+                            self.is_enable and
+                            route_direction in {"left", "right"}):
                         key_down(route_direction)
 
     def is_game_window_active(self):
@@ -321,9 +592,17 @@ class KeyBoardController():
             return False
         else:
             try:
+                target_hwnd = getattr(self, "target_hwnd", None)
+                if getattr(self, "_require_target_hwnd", False):
+                    return bool(
+                        target_hwnd and win32gui.IsWindow(target_hwnd) and
+                        win32gui.GetForegroundWindow() == target_hwnd
+                    )
                 active_window = gw.getActiveWindow()
                 if not active_window:
                     return False
+                if getattr(self, "_window_title_is_exact", False):
+                    return self.window_title == active_window.title
                 return self.window_title in active_window.title
             except Exception as e:
                 return False
@@ -379,6 +658,7 @@ class KeyBoardController():
                     self.cmd_left_right_last = ""
                     self.cmd_up_down_last = ""
                     self.cmd_action_last = "none"
+                    self.clear_aux_actions()
                     self.limit_fps()
                     continue
 
@@ -393,6 +673,7 @@ class KeyBoardController():
                     self.cmd_left_right_last = ""
                     self.cmd_up_down_last = ""
                     self.cmd_action_last = "none"
+                    self.clear_aux_actions()
                     self.limit_fps()
                     continue
 
@@ -409,12 +690,20 @@ class KeyBoardController():
                     self.cmd_left_right_last = ""
                     self.cmd_up_down_last = ""
                     self.cmd_action_last = "none"
+                    self.clear_aux_actions()
                     self.limit_fps()
                     continue
 
-                # Force Heal
+                # "生命值优先补给" keeps horizontal movement active but
+                # suppresses attack/jump/teleport action pulses until HP has
+                # recovered. Potion dispatch itself still obeys cooldown.
                 if self.is_need_force_heal:
-                    cmd_action = "add_hp"
+                    # Only horizontal patrol is retained. Releasing vertical
+                    # input avoids climbing into a portal or continuing a
+                    # ladder/mount sequence while recovery owns the action.
+                    cmd_up_down = "none"
+                    if cmd_action not in {"none", "goal"}:
+                        cmd_action = "none"
 
                 ##########################
                 ### Left-Right Command ###
@@ -470,6 +759,12 @@ class KeyBoardController():
                 ######################
                 ### Action Command ###
                 ######################
+                aux_request = self._take_aux_action(now_monotonic)
+                if aux_request is not None:
+                    self._dispatch_aux_action(aux_request, now_monotonic)
+                    # Recovery owns this action cycle. Movement remains active,
+                    # and the next fresh control frame may emit attack again.
+                    cmd_action = "none"
                 action_rising_edge = cmd_action != self.cmd_action_last
                 if cmd_action == "mount":
                     if action_rising_edge:
@@ -493,11 +788,14 @@ class KeyBoardController():
                                 route_direction=cmd_left_right,
                             )
                         self.t_last_skill = time.time()
-                elif cmd_action == "add_hp":
-                    press_key(self.cfg["key"]["add_hp"])
-                    cmd_action = "none"
-                elif cmd_action == "add_mp":
-                    press_key(self.cfg["key"]["add_mp"])
+                elif cmd_action in {"add_hp", "add_mp"}:
+                    # Compatibility commands use the same bounded request,
+                    # foreground gate and cooldown as HealthMonitor.
+                    self.request_aux_action(
+                        cmd_action,
+                        source_sequence=int(command_updated_at * 1_000_000),
+                        requested_at=now_monotonic,
+                    )
                     cmd_action = "none"
                 elif cmd_action == "goal":
                     pass
@@ -511,6 +809,7 @@ class KeyBoardController():
                 self.limit_fps()
         except Exception as exc:
             logger.error(f"[KeyBoardController] Control loop failed closed: {exc}")
+            self.termination_reason = "input_error"
             self.is_terminated = True
         finally:
             self.release_all_key()

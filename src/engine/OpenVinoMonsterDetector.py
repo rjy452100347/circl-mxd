@@ -6,14 +6,17 @@ import json
 import math
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from types import MappingProxyType
 
 import numpy as np
+
 
 MODEL_WIDTH = 1280
 MODEL_HEIGHT = 224
 MODEL_CLASS_NAMES = {0: "monster", 1: "player"}
+PLAYER_CANDIDATE_CONFIDENCE = 0.25
 ACTIVE_VARIANT = "int8_v2"
 ACTIVE_MODEL_PATH = "int8_v2/models/mixed_head_fp/model.xml"
 
@@ -31,6 +34,28 @@ class MonsterDetectionTiming:
     detections: int = 0
     monsters: int = 0
     players: int = 0
+
+
+@dataclass(frozen=True)
+class DetectionScene:
+    monsters: tuple
+    players: tuple
+    visible_rect: tuple
+    frame_shape: tuple
+    timing: MonsterDetectionTiming
+    # A separate association-only pool: never counted or used as monsters, and
+    # never allowed to displace the runtime's existing top-50 detections.
+    player_candidates: tuple = ()
+
+
+@dataclass(frozen=True)
+class _PlayerCandidateDetection:
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    confidence: float
+    class_id: int = 1
 
 
 def _sha256(path: Path) -> str:
@@ -90,12 +115,38 @@ class OpenVinoMonsterDetector:
         deployment_root,
         *,
         confidence=0.25,
+        min_monster_box_side=10,
+        player_exclusion_width=80,
+        player_exclusion_height=100,
         max_det=50,
         variant="auto",
         runtime_factory=None,
+        player_confidence=None,
     ):
         self.root = Path(deployment_root).expanduser().resolve()
         self.confidence = float(confidence)
+        self._player_candidates_enabled = player_confidence is not None
+        self.player_confidence = self.confidence if player_confidence is None else float(player_confidence)
+        if not .05 <= self.player_confidence <= .95:
+            raise OpenVinoDeploymentError('人物检测置信度必须在 0.05–0.95 之间')
+        try:
+            min_box_side_value = float(min_monster_box_side)
+        except (TypeError, ValueError) as exc:
+            raise OpenVinoDeploymentError(
+                f"YOLO 怪物框最小边长必须是 0–{MODEL_HEIGHT} 之间的整数。"
+            ) from exc
+        if (not math.isfinite(min_box_side_value) or
+                not min_box_side_value.is_integer()):
+            raise OpenVinoDeploymentError(
+                f"YOLO 怪物框最小边长必须是 0–{MODEL_HEIGHT} 之间的整数。"
+            )
+        self.min_monster_box_side = int(min_box_side_value)
+        self.player_exclusion_width = self._parse_exclusion_dimension(
+            player_exclusion_width, MODEL_WIDTH, "宽度"
+        )
+        self.player_exclusion_height = self._parse_exclusion_dimension(
+            player_exclusion_height, MODEL_HEIGHT, "高度"
+        )
         self.max_det = int(max_det)
         requested_variant = str(variant).strip().lower()
         if requested_variant not in {"auto", "fp16", "int8", "int8_v2"}:
@@ -104,18 +155,19 @@ class OpenVinoMonsterDetector:
             )
         if not 0.05 <= self.confidence <= 0.95:
             raise OpenVinoDeploymentError("YOLO 置信度必须在 0.05–0.95 之间。")
+        if not 0 <= self.min_monster_box_side <= MODEL_HEIGHT:
+            raise OpenVinoDeploymentError(
+                f"YOLO 怪物框最小边长必须是 0–{MODEL_HEIGHT} 之间的整数。"
+            )
         if self.max_det != 50:
             raise OpenVinoDeploymentError("当前双类部署要求 yolo_max_det 固定为 50。")
 
         self.manifest = self._validate_deployment(requested_variant)
         factory = runtime_factory or _load_runtime_class(self.root)
         try:
-            self.runtime = factory(
-                self.root,
-                confidence=self.confidence,
-                max_det=self.max_det,
-                variant=self.variant,
-            )
+            kwargs = {"confidence": min(self.confidence, self.player_confidence), "max_det": self.max_det}
+            kwargs["variant"] = self.variant
+            self.runtime = factory(self.root, **kwargs)
         except OpenVinoDeploymentError:
             raise
         except Exception as exc:
@@ -126,6 +178,47 @@ class OpenVinoMonsterDetector:
         self.last_visible_rect = (0, 0, 0, 0)
         self.last_players = []
         self.last_player_foot = None
+
+    @staticmethod
+    def _parse_exclusion_dimension(value, maximum, label):
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise OpenVinoDeploymentError(
+                f"YOLO 人物排除区{label}必须是 0–{maximum} px 之间的整数。"
+            ) from exc
+        if (not math.isfinite(number) or not number.is_integer() or
+                not 0 <= number <= maximum):
+            raise OpenVinoDeploymentError(
+                f"YOLO 人物排除区{label}必须是 0–{maximum} px 之间的整数。"
+            )
+        return int(number)
+
+    def player_exclusion_rect(self, frame_shape, anchor):
+        """Return the clipped player exclusion rectangle in frame coordinates."""
+        if (anchor is None or self.player_exclusion_width == 0 or
+                self.player_exclusion_height == 0 or len(frame_shape) < 2):
+            return None
+        frame_height, frame_width = map(int, frame_shape[:2])
+        if frame_width <= 0 or frame_height <= 0:
+            return None
+        try:
+            player_x, player_y = map(float, anchor)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(player_x) or not math.isfinite(player_y):
+            return None
+        half_width = self.player_exclusion_width / 2.0
+        x0 = max(0, min(frame_width - 1, math.floor(player_x - half_width)))
+        x1 = max(0, min(frame_width - 1, math.ceil(player_x + half_width)))
+        y0 = max(
+            0,
+            min(frame_height - 1, math.floor(
+                player_y - self.player_exclusion_height
+            )),
+        )
+        y1 = max(0, min(frame_height - 1, math.ceil(player_y)))
+        return (x0, y0, x1, y1)
 
     def _validate_deployment(self, requested_variant="auto"):
         manifest_path = self.root / "manifest.json"
@@ -241,7 +334,81 @@ class OpenVinoMonsterDetector:
                 frame[src_y0:src_y1, src_x0:src_x1]
         return np.ascontiguousarray(crop), (desired_x0, desired_y0), visible
 
-    def detect(self, frame, player_foot):
+    def detect(self, frame, player_foot, *, player_exclusion_anchor=None):
+        scene = self.detect_scene(frame, player_foot)
+        return self.finalize_scene(scene, player_exclusion_anchor)
+
+    def finalize_scene(self, scene, player_exclusion_anchor=None):
+        exclusion = self.player_exclusion_rect(scene.frame_shape, player_exclusion_anchor)
+        monsters = []
+        for item in scene.monsters:
+            x, y = item['position']
+            w, h = item['size']
+            if exclusion is not None and exclusion[0] <= x+w/2 <= exclusion[2] and exclusion[1] <= y+h/2 <= exclusion[3]:
+                continue
+            monsters.append(dict(item))
+        self.last_timing = replace(scene.timing, monsters=len(monsters),
+                                   detections=len(monsters)+len(scene.players))
+        return monsters
+
+    def _current_player_candidates(self, predictions):
+        """Read the output of the just-completed synchronous prediction only.
+
+        Both deployed and protected runtimes reuse one InferRequest. Reading
+        its result immediately after predict() does not run inference again or
+        change the confidence/max_det filtering of its public result. Copying
+        prevents the next infer() from overwriting this scene's candidates.
+        Runtimes without that contract can only expose their current public
+        detections; no cached fallback or second prediction is permitted.
+        """
+        if not self._player_candidates_enabled:
+            return ()
+        request = getattr(self.runtime, "infer_request", None)
+        if request is None or not callable(getattr(request, "get_output_tensor", None)):
+            return predictions
+        raw = np.array(request.get_output_tensor().data, copy=True)
+        if raw.shape != (1, 300, 6):
+            return predictions
+        rows = raw[0]
+        rows = rows[(rows[:, 5] == 1) &
+                    (rows[:, 4] >= PLAYER_CANDIDATE_CONFIDENCE) &
+                    np.isfinite(rows).all(axis=1)]
+        return tuple(_PlayerCandidateDetection(
+            x1=float(np.clip(row[0], 0, MODEL_WIDTH)),
+            y1=float(np.clip(row[1], 0, MODEL_HEIGHT)),
+            x2=float(np.clip(row[2], 0, MODEL_WIDTH)),
+            y2=float(np.clip(row[3], 0, MODEL_HEIGHT)),
+            confidence=float(row[4]),
+        ) for row in rows)
+
+    def _convert_detection(self, detection, frame_shape, origin, threshold):
+        class_id = int(getattr(detection, "class_id"))
+        confidence = float(getattr(detection, "confidence"))
+        if class_id not in MODEL_CLASS_NAMES or confidence < threshold:
+            return None
+        values = [float(getattr(detection, key))
+                  for key in ("x1", "y1", "x2", "y2")]
+        if not all(math.isfinite(value) for value in values + [confidence]):
+            return None
+        frame_height, frame_width = frame_shape[:2]
+        origin_x, origin_y = origin
+        x1 = max(0, min(frame_width, math.floor(values[0] + origin_x)))
+        y1 = max(0, min(frame_height, math.floor(values[1] + origin_y)))
+        x2 = max(0, min(frame_width, math.ceil(values[2] + origin_x)))
+        y2 = max(0, min(frame_height, math.ceil(values[3] + origin_y)))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        width, height = x2 - x1, y2 - y1
+        if class_id == 0 and min(width, height) < self.min_monster_box_side:
+            return None
+        return {
+            "name": MODEL_CLASS_NAMES[class_id],
+            "position": (x1, y1), "size": (width, height),
+            "confidence": confidence, "score": 1.0 - confidence,
+            "class_id": class_id, "detector": "openvino_yolo",
+        }
+
+    def detect_scene(self, frame, player_foot):
         total_start = time.perf_counter()
         crop_start = total_start
         image, origin, visible = self.crop_input(frame, player_foot)
@@ -252,40 +419,27 @@ class OpenVinoMonsterDetector:
         infer_end = time.perf_counter()
 
         convert_start = infer_end
-        frame_height, frame_width = frame.shape[:2]
-        origin_x, origin_y = origin
+        candidate_predictions = self._current_player_candidates(predictions)
         monsters = []
         players = []
         for detection in predictions:
             class_id = int(getattr(detection, "class_id"))
-            confidence = float(getattr(detection, "confidence"))
-            if class_id not in MODEL_CLASS_NAMES or confidence < self.confidence:
+            threshold = self.player_confidence if class_id == 1 else self.confidence
+            item = self._convert_detection(detection, frame.shape, origin, threshold)
+            if item is None:
                 continue
-            values = [
-                float(getattr(detection, key))
-                for key in ("x1", "y1", "x2", "y2")
-            ]
-            if not all(math.isfinite(value) for value in values + [confidence]):
-                continue
-            x1 = max(0, min(frame_width, math.floor(values[0] + origin_x)))
-            y1 = max(0, min(frame_height, math.floor(values[1] + origin_y)))
-            x2 = max(0, min(frame_width, math.ceil(values[2] + origin_x)))
-            y2 = max(0, min(frame_height, math.ceil(values[3] + origin_y)))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            item = {
-                "name": MODEL_CLASS_NAMES[class_id],
-                "position": (x1, y1),
-                "size": (x2 - x1, y2 - y1),
-                "confidence": confidence,
-                "score": 1.0 - confidence,
-                "class_id": class_id,
-                "detector": "openvino_yolo",
-            }
             if class_id == 0:
                 monsters.append(item)
             else:
                 players.append(item)
+        player_candidates = []
+        for detection in candidate_predictions:
+            if getattr(detection, "class_id") != 1:
+                continue
+            item = self._convert_detection(
+                detection, frame.shape, origin, PLAYER_CANDIDATE_CONFIDENCE)
+            if item is not None:
+                player_candidates.append(MappingProxyType(item))
         convert_end = time.perf_counter()
         self.last_visible_rect = visible
         self.last_players = players
@@ -314,4 +468,7 @@ class OpenVinoMonsterDetector:
             monsters=len(monsters),
             players=len(players),
         )
-        return monsters
+        return DetectionScene(tuple(MappingProxyType(dict(item)) for item in monsters),
+                              tuple(MappingProxyType(dict(item)) for item in players),
+                              visible, frame.shape, self.last_timing,
+                              tuple(player_candidates))
