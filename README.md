@@ -4,11 +4,12 @@
 
 > 使用自动化程序可能违反游戏或平台规则，并可能导致账号受限或封禁。请只在获得明确许可的测试环境中使用。项目不读取游戏内存，不提供反作弊绕过，也不保证适用于任何具体服务器或客户端版本。
 ## 历史界面演示（录制于旧版本）
-![主界面演示](docs/output.gif)
 
-![运行演示](docs/output2.gif)
-
-![路线演示](docs/output3.gif)
+<p>
+  <img src="docs/output.gif" alt="主界面演示" width="250">
+  <img src="docs/output2.gif" alt="运行演示" width="250">
+  <img src="docs/output3.gif" alt="路线演示" width="250">
+</p>
 ## 自动打怪逻辑
 1.yolo对全屏幕进行检测，检测对象包含所有怪物（monster）、玩家（player）、自己（self）
 2.对self设置范围内的攻击和移动
