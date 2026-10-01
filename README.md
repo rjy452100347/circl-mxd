@@ -10,6 +10,7 @@
   <img src="docs/output2.gif" alt="运行演示" width="250">
   <img src="docs/output3.gif" alt="路线演示" width="250">
 </p>
+
 ## 自动打怪逻辑
 1.yolo对全屏幕进行检测，检测对象包含所有怪物（monster）、玩家（player）、自己（self）
 2.对self设置范围内的攻击和移动
