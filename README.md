@@ -9,14 +9,20 @@
 ![运行演示](docs/output2.gif)
 
 ![路线演示](docs/output3.gif)
+## 自动打怪逻辑
+1.yolo对全屏幕进行检测，检测对象包含所有怪物（monster）、玩家（player）、自己（self）
+2.对self设置范围内的攻击和移动
+3.固定平台校准ROI区域后，会自动定位玩家黄点，并生成以黄点为中心的左右边界
+4.人物会在边界内来回移动，若发现怪物，则会追击
+
+
 ## 这个版本包含什么
 ![路线演示](docs/f94c3c7aa0a0e81a035d411ade7c6ab1.png)
 - 简体中文主界面和高级设置；
 - `normal`、`aux`、`patrol`、固定平台及持续攻击运行模式（仅固定平台及持续攻击运行模式测试好用）；
-- ` OpenVINO `int8_head_fp` 三分类全屏检测：`monster`、`player`、`self`；
 - 使用 `self` 框定位人物，寻找同层可达怪物并定向攻击；
 - 小地图巡逻、路线录制、ROI 校准、血蓝监控和状态诊断；
-- 保留旧双分类模型与名字样本定位流程的兼容能力。
+- 保留旧双分类模型与名字样本定位流程的兼容能力。(切换代码分支)
 
 ## 环境要求
 
@@ -46,12 +52,11 @@ python -m pip install pytest
 
 ## 首次运行前必须准备的资源
 
-仓库有意排除了所有运行素材。至少需要自行准备：
+至少需要自行准备：
 
-1. OpenVINO 部署包；三分类配置使用 `warrior_v3` 的 `int8_head_fp` 模型；
-2. 普通路线模式使用的小地图底图和路线图；固定平台模式点击《校准小地图roi》需校准小地图并应用；
-
-三分类模式无需名字样本。模型目录结构和输入契约见 [资源准备说明](docs/RESOURCE_SETUP.md)。未准备资源时可以打开主界面，但点击开始或按 F1 会显示缺失资源错误并拒绝启动。
+1. OpenVINO 部署包；由于yolo检测的self类别需要自己训练，所有仅提供二分类检测（怪物、玩家），可基于自行标注的数据集+自己的人物数据 微调20epoch，推理使用cpu的 OpenVINO引擎加速，可自行量化（建议使用fp8类型）。
+2. 固定平台模式点击《校准小地图roi》需校准小地图并应用；
+3.三分类模式无需名字样本。模型目录结构和输入契约见 [资源准备说明](docs/RESOURCE_SETUP.md)。未准备资源时可以打开主界面，但点击开始或按 F1 会显示缺失资源错误并拒绝启动。
 
 ## 配置
 
@@ -83,7 +88,7 @@ python -m tools.nametagCalibrator --profile classic_cn_player --cfg classic_cn
 
 按工具提示冻结画面、框选唯一名字文字并点击人物脚底。输出会写入 `nametag/classic_cn_player/`，该目录默认被 Git 忽略。
 
-## 录制小地图与路线
+## 录制小地图与路线（不太精准，不建议使用）
 
 ```powershell
 python -m tools.routeRecorder --new_map your_map_id --cfg classic_cn
@@ -118,8 +123,11 @@ python -m tools.routeRecorder --new_map your_map_id --cfg classic_cn
 QQ 群：860498805
 
 ## 打赏
-![路线演示](docs/weix.jpg)
-![路线演示](docs/zhifub.jpg)
+
+<p>
+  <img src="docs/weix.jpg" alt="微信打赏" width="200">
+  <img src="docs/zhifub.jpg" alt="支付宝打赏" width="200">
+</p>
 
 ## 技术支持联系群主
 - 版权问题，不公开提供训练所需数据集，各位可自行标注。
