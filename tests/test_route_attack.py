@@ -178,6 +178,29 @@ def test_yolo_observation_uses_fixed_strip_backend_without_legacy_fusion():
     assert list(bot.monster_detection_times) == [5.2]
 
 
+def test_yolo_observation_passes_only_current_valid_nametag_as_exclusion_anchor():
+    bot = _route_attack_bot()
+    anchors = []
+
+    class Detector:
+        last_timing = SimpleNamespace(
+            crop_ms=0.1, infer_ms=5.0, convert_ms=0.1,
+            total_ms=5.2, monsters=0, players=0,
+        )
+
+        def detect(self, _frame, _player, *, player_exclusion_anchor=None):
+            anchors.append(player_exclusion_anchor)
+            return []
+
+    bot.monster_detector = Detector()
+    bot.current_nametag_valid = True
+    bot.update_monster_observations()
+    bot.current_nametag_valid = False
+    bot.update_monster_observations()
+
+    assert anchors == [bot.loc_player, None]
+
+
 def test_yolo_search_range_matches_visible_model_strip():
     bot = _route_attack_bot()
     bot.img_frame = np.zeros((500, 1600, 3), dtype=np.uint8)

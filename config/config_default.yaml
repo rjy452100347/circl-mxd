@@ -1,5 +1,5 @@
 bot:
-  mode: normal # Options: "normal" "aux" "patrol"
+  mode: normal # Options: "normal" "aux" "patrol" "fixed_platform" "continuous_attack"
   attack: directional # Options: "directional" "aoe_skill"
   route_attack: false
   map: ''
@@ -21,7 +21,8 @@ aoe_skill:
   range_y: 170
   cooldown: 0.05
 health_monitor:
-  enable: true
+  auto_hp_enabled: true
+  auto_mp_enabled: true
   force_heal: false
   add_hp_percent: 50
   add_mp_percent: 50
@@ -40,10 +41,15 @@ edge_teleport:
   color_code: [255, 127, 127]
 nametag:
   name: classic_cn_player
+  # 0 keeps legacy behavior and reuses ui_coords.ui_y_start.
+  search_y_limit: 0
 monster_detect:
   openvino_deployment_root: deployment/openvino_cpu_2class
-  yolo_variant: int8_v2 # Options: "int8_v2" "fp16" "int8"
+  yolo_variant: int8_v2 # Options: "int8_v2"
   yolo_confidence: 0.60
+  yolo_min_monster_box_side: 10 # px; 0 disables small-box filtering
+  yolo_player_exclusion_width: 80 # px; 0 disables player-area filtering
+  yolo_player_exclusion_height: 100 # px; 0 disables player-area filtering
   yolo_max_det: 50
 combat_tracking:
   pursuit_vertical_tolerance: 70
@@ -69,6 +75,20 @@ route:
   search_range: 10
   jump_down_cooldown: 3.0
   traversal_commit_seconds: 0.45
+  mount_horizontal_tolerance: 6
+  mount_precision_tolerance: 1
+  mount_settle_frames: 2
+  mount_forward_hold_frames: 4
+  mount_retry_runup_distance: 8
+  mount_attempt_timeout: 1.5
+  mount_confirm_frames: 3
+  mount_max_attempts: 5
+  mount_retry_frames: 5
+  mount_success_distance: 12
+  ladder_record_combo_seconds: 0.6
+  ladder_record_timeout_seconds: 1.8
+  ladder_record_success_distance: 12
+  ladder_record_confirm_frames: 3
   color_code:
     "255,0,0": "left none none"
     "0,0,255": "right none none"
@@ -99,6 +119,8 @@ patrol:
   range: [0.2, 0.8]
   turn_point_thres: 10
   patrol_attack_interval: 2.5
+fixed_platform:
+  width_px: 80
 game_window:
   title: MapleStory Worlds
   size: [693, 1282]

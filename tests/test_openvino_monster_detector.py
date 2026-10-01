@@ -100,11 +100,12 @@ def _deployment(tmp_path, *, classes=None, active=None):
     return root
 
 
-def _detector(tmp_path, predictions=()):
+def _detector(tmp_path, predictions=(), **detector_kwargs):
     runtime = _Runtime(predictions)
     detector = OpenVinoMonsterDetector(
         _deployment(tmp_path),
         runtime_factory=lambda *_args, **_kwargs: runtime,
+        **detector_kwargs,
     )
     return detector, runtime
 
@@ -181,6 +182,18 @@ def test_confidence_range_and_fixed_max_det_are_enforced(tmp_path):
         OpenVinoMonsterDetector(root, max_det=49, runtime_factory=factory)
 
 
+@pytest.mark.parametrize("value", [-1, 225, 10.5, "not-an-integer"])
+def test_min_monster_box_side_range_and_integer_are_enforced(tmp_path, value):
+    root = _deployment(tmp_path)
+    factory = lambda *_args, **_kwargs: _Runtime([])
+    with pytest.raises(OpenVinoDeploymentError, match="0–224"):
+        OpenVinoMonsterDetector(
+            root, min_monster_box_side=value, runtime_factory=factory
+        )
+
+
+
+
 def test_centered_crop_is_native_size_and_contiguous(tmp_path):
     detector, runtime = _detector(tmp_path)
     frame = np.full((500, 1600, 3), 17, dtype=np.uint8)
@@ -250,6 +263,124 @@ def test_detection_conversion_maps_to_frame_and_preserves_score_semantics(tmp_pa
         "detector": "openvino_yolo",
     }]
     assert detector.last_player_foot == (165, 148)
+
+
+def test_small_monster_boxes_are_filtered_after_conversion_only(tmp_path):
+    predictions = [
+        _Detection(20, 20, 29, 70, 0.9, 0),
+        _Detection(40, 20, 70, 29, 0.9, 0),
+        _Detection(80, 20, 90, 50, 0.9, 0),
+        _Detection(100, 20, 105, 25, 0.9, 1),
+    ]
+    detector, _ = _detector(
+        tmp_path, predictions, min_monster_box_side=10
+    )
+    frame = np.zeros((500, 1600, 3), dtype=np.uint8)
+
+    monsters = detector.detect(frame, (800, 250))
+
+    assert [item["size"] for item in monsters] == [(10, 30)]
+    assert [item["size"] for item in detector.last_players] == [(5, 5)]
+    assert detector.last_timing.detections == 2
+    assert detector.last_timing.monsters == 1
+    assert detector.last_timing.players == 1
+
+
+def test_zero_min_monster_box_side_disables_filter(tmp_path):
+    detector, _ = _detector(
+        tmp_path,
+        [_Detection(5, 5, 6, 6, 0.9, 0)],
+        min_monster_box_side=0,
+    )
+    frame = np.zeros((500, 1600, 3), dtype=np.uint8)
+
+    monsters = detector.detect(frame, (800, 250))
+
+    assert [item["size"] for item in monsters] == [(1, 1)]
+    assert detector.last_timing.detections == 1
+    assert detector.last_timing.monsters == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("player_exclusion_width", -1, "0–1280"),
+        ("player_exclusion_width", 1281, "0–1280"),
+        ("player_exclusion_width", 80.5, "0–1280"),
+        ("player_exclusion_height", -1, "0–224"),
+        ("player_exclusion_height", 225, "0–224"),
+        ("player_exclusion_height", "bad", "0–224"),
+    ],
+)
+def test_player_exclusion_dimensions_are_validated(tmp_path, field, value, message):
+    with pytest.raises(OpenVinoDeploymentError, match=message):
+        _detector(tmp_path, **{field: value})
+
+
+def test_player_exclusion_filters_monster_centers_including_boundary(tmp_path):
+    predictions = [
+        _Detection(610, 42, 650, 82, 0.95, 0),  # center inside
+        _Detection(590, 42, 610, 82, 0.94, 0),  # center on left boundary
+        _Detection(670, 42, 710, 82, 0.93, 0),  # overlaps, center outside
+        _Detection(610, 42, 650, 82, 0.92, 1),  # player is never filtered
+    ]
+    detector, _ = _detector(
+        tmp_path,
+        predictions,
+        player_exclusion_width=80,
+        player_exclusion_height=100,
+    )
+    frame = np.zeros((500, 1600, 3), dtype=np.uint8)
+
+    monsters = detector.detect(
+        frame, (800, 250), player_exclusion_anchor=(800, 250)
+    )
+
+    assert [item["position"] for item in monsters] == [(830, 180)]
+    assert len(detector.last_players) == 1
+    assert detector.last_timing.detections == 2
+    assert detector.last_timing.monsters == 1
+    assert detector.last_timing.players == 1
+
+
+@pytest.mark.parametrize(
+    "dimensions", [(0, 100), (80, 0)]
+)
+def test_zero_player_exclusion_dimension_disables_filter(tmp_path, dimensions):
+    detector, _ = _detector(
+        tmp_path,
+        [_Detection(610, 42, 650, 82, 0.95, 0)],
+        player_exclusion_width=dimensions[0],
+        player_exclusion_height=dimensions[1],
+    )
+    frame = np.zeros((500, 1600, 3), dtype=np.uint8)
+
+    monsters = detector.detect(
+        frame, (800, 250), player_exclusion_anchor=(800, 250)
+    )
+
+    assert len(monsters) == 1
+
+
+def test_missing_player_exclusion_anchor_does_not_use_stale_location(tmp_path):
+    detector, _ = _detector(
+        tmp_path, [_Detection(610, 42, 650, 82, 0.95, 0)]
+    )
+    frame = np.zeros((500, 1600, 3), dtype=np.uint8)
+
+    monsters = detector.detect(frame, (800, 250))
+
+    assert len(monsters) == 1
+
+
+def test_player_exclusion_rect_is_clipped_to_frame_edges(tmp_path):
+    detector, _ = _detector(
+        tmp_path, player_exclusion_width=80, player_exclusion_height=100
+    )
+
+    assert detector.player_exclusion_rect((50, 60, 3), (5, 10)) == (
+        0, 0, 45, 10
+    )
 
 
 def test_nearest_player_to_anchor_is_selected_for_diagnostic_foot(tmp_path):

@@ -24,6 +24,7 @@ class RouteIntent:
     def is_critical(self):
         return (
             self.reason == "route_lost" or
+            self.reason.startswith("semantic_ladder_") or
             self.move_x == "stop" or
             self.move_y != "none" or
             self.action in CRITICAL_ROUTE_ACTIONS

@@ -12,7 +12,7 @@ import cv2
 
 # local import
 from src.utils.logger import logger
-from src.utils.common import get_game_window_title_by_token, load_image, resize_window
+from src.utils.common import get_game_window_target_by_token, load_image, resize_window
 from src.runtime_policy import RUNTIME_POLICY
 
 class GameWindowCapturor:
@@ -23,6 +23,7 @@ class GameWindowCapturor:
         self.cfg = cfg
         self.frame = None
         self.frame_received_at = None
+        self.frame_sequence = -1
         self.lock = threading.Lock()
         self.is_terminated = False
         self.is_capture_closed = False
@@ -36,6 +37,7 @@ class GameWindowCapturor:
         self.t_last_run = 0.0
         self.capture_control = None
         self.window_title = ""
+        self.window_hwnd = None
 
         # If use test image as input, disable the whole capture thread
         if test_image_name is not None:
@@ -43,12 +45,13 @@ class GameWindowCapturor:
             return
 
         # Get game window title
-        self.window_title = get_game_window_title_by_token(cfg["game_window"]["title"])
-        if self.window_title is None:
+        target = get_game_window_target_by_token(cfg["game_window"]["title"])
+        if target is None:
             raise RuntimeError(
                 f"[GameWindowCapturor] Unable to find window title containing: {cfg['game_window']['title']}"
             )
         else:
+            self.window_hwnd, self.window_title = target
             logger.info(f"[GameWindowCapturor] Found game window title: {self.window_title}")
 
         if cfg["game_window"].get("resize_on_start", True):
@@ -72,6 +75,7 @@ class GameWindowCapturor:
         with self.lock:
             self.frame = frame.frame_buffer
             self.frame_received_at = time.monotonic()
+            self.frame_sequence += 1
             self.is_capture_closed = False
         self.limit_fps()
 
@@ -90,6 +94,11 @@ class GameWindowCapturor:
         '''
         Safely get latest game window frame.
         '''
+        packet = self.get_frame_packet()
+        return None if packet is None else packet[0]
+
+    def get_frame_packet(self):
+        """Atomically return an owned frame with its capture time/sequence."""
         with self.lock:
             if self.frame is None:
                 return None
@@ -99,13 +108,25 @@ class GameWindowCapturor:
                 if time.monotonic() - self.frame_received_at > self.frame_stale_timeout:
                     return None
             if self.frame.ndim == 3 and self.frame.shape[2] == 3:
-                return self.frame.copy()
-            if self.frame.ndim == 3 and self.frame.shape[2] == 4:
-                return cv2.cvtColor(self.frame, cv2.COLOR_BGRA2BGR)
-            logger.error(
-                f"[GameWindowCapturor] Unsupported frame shape: {self.frame.shape}"
+                owned_frame = self.frame.copy()
+            elif self.frame.ndim == 3 and self.frame.shape[2] == 4:
+                owned_frame = cv2.cvtColor(self.frame, cv2.COLOR_BGRA2BGR)
+            else:
+                logger.error(
+                    f"[GameWindowCapturor] Unsupported frame shape: {self.frame.shape}"
+                )
+                return None
+            # A static debug image intentionally has no real capture age or
+            # source sequence; callers may treat each control pass as fresh.
+            captured_at = (
+                time.monotonic() if self.is_static_test_frame else
+                self.frame_received_at
             )
-            return None
+            source_sequence = (
+                None if self.is_static_test_frame else
+                int(getattr(self, "frame_sequence", 0))
+            )
+            return owned_frame, captured_at, source_sequence
 
     def stop(self):
         '''

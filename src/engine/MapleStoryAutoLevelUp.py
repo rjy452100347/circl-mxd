@@ -6,12 +6,13 @@ python mapleStoryAutoLevelUp.py --map cloud_balcony --monster brown_windup_bear,
 import time
 import random
 import argparse
+import copy
 import glob
 import sys
 import logging
-import os
 import threading
 from collections import deque
+from pathlib import Path
 
 # Library import
 import numpy as np
@@ -29,31 +30,47 @@ from src.utils.common import (find_pattern_sqdiff, draw_rectangle,
     activate_game_window, is_img_16_to_9, normalize_pixel_coordinate, resize_window,
     prepare_game_frame,
 )
-from src.input.KeyBoardController import KeyBoardController, press_key
+from src.input.KeyBoardController import KeyBoardController
 from src.input.KeyBoardListener import KeyBoardListener
 if is_mac():
     from src.input.GameWindowCapturorForMac import GameWindowCapturor
 else:
     from src.input.GameWindowCapturor import GameWindowCapturor
 from src.engine.HealthMonitor import HealthMonitor
+from src.engine.MinimapPoseTracker import MinimapPoseTracker
 from src.engine.Profiler import Profiler
 from src.engine.FiniteStateMachine import FiniteStateMachine
 from src.engine.RouteNavigator import RouteNavigator
+from src.engine.SemanticRoute import (
+    SemanticRouteError,
+    load_semantic_route_set,
+)
+from src.engine.SemanticRouteNavigator import SemanticRouteNavigator
 from src.engine.RouteCombatArbiter import (
     CombatIntent,
     RouteCombatArbiter,
     RouteIntent,
 )
 from src.engine.NameTagLocalizer import NameTagLocalizer
+from src.engine.NameTagProfileRepository import (
+    NameTagProfileError,
+    NameTagProfileRepository,
+)
 from src.engine.OpenVinoMonsterDetector import (
     OpenVinoDeploymentError,
     OpenVinoMonsterDetector,
 )
+from src.engine.MapProjectConfig import (
+    apply_map_minimap_roi_override,
+    MapProjectConfigError,
+)
 from src.states.hunting import HuntingState
 from src.states.auxiliary import AuxiliaryState
 from src.states.patrol import PatrolState
+from src.states.fixed_platform import FixedPlatformState
+from src.states.continuous_attack import ContinuousAttackState
 from src.runtime_policy import RUNTIME_POLICY
-from src.config_compat import validate_custom_config
+from src.config_compat import migrate_health_monitor_config, validate_custom_config
 
 
 
@@ -70,20 +87,29 @@ class MapleStoryAutoBot:
         self.idx_routes = 0 # Index of route map
         self.monsters = [] # monster detected in current frame
         self.monster_detector = None # required monster/player OpenVINO detector
-        self.monster_detection_times = deque(maxlen=300)
-        self.monster_frame_pipeline_times = deque(maxlen=300)
+        control_window = RUNTIME_POLICY.main_fps * 5 * 60
+        preview_window = RUNTIME_POLICY.preview_fps * 5 * 60
+        self.monster_detection_times = deque(maxlen=control_window)
+        self.monster_inference_times = deque(maxlen=control_window)
+        self.monster_frame_pipeline_times = deque(maxlen=control_window)
+        self.visualization_compose_times = deque(maxlen=preview_window)
+        self.visualization_publish_times = deque(maxlen=preview_window)
         self.debug_attack_direction = "none" # passive combat decision display
         self.fps = 0 # Frame per second
+        self.control_frame_sequence = 0
         self.red_dot_center_prev = None # previous other player location in minimap
         self.color_code = {} # For color code instruction
         self.color_code_up_down = {} # Color code only contain 'up' and 'down'
         self.thread_auto_bot = None # thread for running autobot
+        self.run_generation = 0
         self.cmd_move_x = "none" # "left" "right"
         self.cmd_move_y = "none" # "up" "down"
         self.cmd_action = "none" # "jump" "attack" ....
         # Signals (for UI)
-        self.image_debug_signal = None
-        self.route_map_viz_signal = None
+        self.visualization_sink = None
+        self.termination_sink = None
+        self._visualization_request = threading.Event()
+        self._frame_visualization_mode = None
         self.viz_mode = "game"
         self.t_last_viz_frame = 0.0
         # Flags
@@ -105,8 +131,9 @@ class MapleStoryAutoBot:
         self.loc_watch_dog = (0, 0) # watch dog location on global map
         # Images
         self.frame = None # raw image
+        self.frame_captured_at = 0.0
+        self.capture_frame_sequence = None
         self.img_frame = None # game window frame
-        self.img_frame_gray = None # game window frame graysale
         self.img_frame_debug = None # game window frame for visualization
         self.img_route = None # route map
         self.img_route_debug = None # route map for visualization
@@ -131,6 +158,7 @@ class MapleStoryAutoBot:
         self.health_monitor = None # Health monitor
         self.profiler = None # Profiler, for performance issue debugging
         self.route_navigator = None
+        self.route_source = "legacy"
         self.route_combat_arbiter = RouteCombatArbiter()
         self.last_route_intent = RouteIntent("none", "none", "none")
         self.last_combat_intent = CombatIntent()
@@ -144,25 +172,127 @@ class MapleStoryAutoBot:
         self.nametag_localizer = None
         self.nametag_last_result = None
         self.localization_score = 1.0
+        self.minimap_pose_tracker = MinimapPoseTracker(
+            lambda *args, **kwargs: find_pattern_sqdiff(*args, **kwargs)
+        )
+        self.minimap_pose_snapshot = self.minimap_pose_tracker.last_snapshot
         self.last_visual_pause_reason = ""
+        self.current_minimap_roi_valid = False
+        self.current_minimap_player_valid = False
+        self.current_nametag_valid = False
+        self.minimap_roi_source = "automatic"
+        self._minimap_roi_pixels_logged = False
 
         # Finite State Machine
         self.fsm = FiniteStateMachine()
         self.fsm.add_state(HuntingState    ("hunting"     , self))
         self.fsm.add_state(AuxiliaryState  ("aux"         , self))
         self.fsm.add_state(PatrolState     ("patrol"      , self))
+        self.fixed_platform_state = FixedPlatformState("fixed_platform", self)
+        self.fsm.add_state(self.fixed_platform_state)
+        self.continuous_attack_state = ContinuousAttackState(
+            "continuous_attack", self
+        )
+        self.fsm.add_state(self.continuous_attack_state)
         self.fsm.set_init_state("hunting")
 
-    def update_signals(self, image_debug_signal, route_map_viz_signal):
-        '''
-        Update signal from UI framework.
-        For debug window viz
-        '''
-        self.image_debug_signal = image_debug_signal
-        self.route_map_viz_signal = route_map_viz_signal
+    def set_visualization_sink(self, sink):
+        """Install the controller-owned capacity-one preview publisher."""
+        self.visualization_sink = sink
+
+    def set_termination_sink(self, sink):
+        """Install a lightweight worker-stop notifier owned by the UI layer."""
+        self.termination_sink = sink
+
+    def request_visualization(self):
+        """Request one preview; repeated requests coalesce into one event."""
+        if self.is_need_show_debug_window:
+            if not hasattr(self, "_visualization_request"):
+                self._visualization_request = threading.Event()
+            self._visualization_request.set()
+
+    def _claim_visualization_mode(self):
+        if not self.is_need_show_debug_window:
+            return None
+        if not getattr(self, "is_ui", False):
+            # The standalone debug runner still owns both OpenCV windows.
+            return "both"
+        if not self._visualization_request.is_set():
+            return None
+        self._visualization_request.clear()
+        return self.viz_mode
+
+    @staticmethod
+    def prepare_runtime_config(cfg):
+        """Validate mode-specific invariants on an isolated runtime copy."""
+        runtime_cfg = copy.deepcopy(cfg)
+        migrate_health_monitor_config(runtime_cfg)
+        mode = runtime_cfg.get("bot", {}).get("mode")
+        if mode not in {
+            "normal", "aux", "patrol", "fixed_platform", "continuous_attack"
+        }:
+            raise ValueError(f"不支持的运行模式：{mode}")
+        if mode == "fixed_platform":
+            width_px = runtime_cfg.get("fixed_platform", {}).get("width_px")
+            if (isinstance(width_px, bool) or not isinstance(width_px, int) or
+                    not 10 <= width_px <= 1000):
+                raise ValueError(
+                    "小地图巡逻总宽度必须是 10–1000 px 之间的整数。"
+                )
+            runtime_cfg["bot"]["route_only"] = False
+            runtime_cfg["bot"]["route_attack"] = False
+        elif mode == "continuous_attack":
+            if runtime_cfg.get("bot", {}).get("attack") != "directional":
+                raise ValueError("持续定向攻击模式仅支持方向攻击。")
+            if not str(runtime_cfg.get("key", {}).get(
+                    "directional_attack", "")).strip():
+                raise ValueError("持续定向攻击模式的攻击键不能为空。")
+            if not str(runtime_cfg.get("key", {}).get("jump", "")).strip():
+                raise ValueError("持续定向攻击模式的跳跃键不能为空。")
+            runtime_cfg["bot"]["route_only"] = False
+            runtime_cfg["bot"]["route_attack"] = False
+        return runtime_cfg
 
     def load_config(self, cfg):
         """Load route assets, the required name-tag profile and YOLO model."""
+        # Runtime normalization must not mutate the UI/profile snapshot.  The
+        # classic profile enables route_only, while fixed-platform mode is an
+        # independent local patrol mode that must never enter route control.
+        self._report_load_stage("window", "正在校验运行配置")
+        try:
+            cfg = self.prepare_runtime_config(cfg)
+        except ValueError as exc:
+            logger.error(f"[配置] {exc}")
+            return -1
+
+        self.minimap_pose_tracker = MinimapPoseTracker(
+            lambda *args, **kwargs: find_pattern_sqdiff(*args, **kwargs),
+            max_score=float(
+                cfg.get("route", {}).get("localization_max_score", 0.20)
+            ),
+        )
+        self.minimap_pose_snapshot = self.minimap_pose_tracker.last_snapshot
+
+        if cfg["bot"]["mode"] != "continuous_attack":
+            self._report_load_stage("roi", "正在加载当前地图 ROI 配置")
+            map_name = str(cfg.get("bot", {}).get("map", "")).strip()
+            try:
+                self.minimap_roi_source = apply_map_minimap_roi_override(
+                    cfg, map_name, Path("minimaps")
+                )
+            except MapProjectConfigError as exc:
+                logger.error(f"[小地图ROI] 加载失败，已阻止启动：{exc}")
+                return -1
+            self._minimap_roi_pixels_logged = False
+            logger.info(
+                f"[小地图ROI] source={self.minimap_roi_source} "
+                f"normalized={cfg.get('minimap', {}).get('roi')}"
+            )
+        else:
+            self.minimap_roi_source = "unused_continuous_attack"
+            self._minimap_roi_pixels_logged = False
+            logger.info("[持续定向攻击] 不加载小地图 ROI、地图或路线资源。")
+
         # Parse color code in config
         self.color_code = {
             tuple(map(int, k.split(','))): v
@@ -174,14 +304,11 @@ class MapleStoryAutoBot:
         }
 
         if cfg["bot"]["mode"] == "normal":
+            self._report_load_stage("map", "正在加载地图底图")
             map_name = cfg['bot']['map']
-            map_path = f"minimaps/{map_name}/map.png"
-            if not map_name or not os.path.isfile(map_path):
-                logger.error(
-                    f"[路线资源] 缺少小地图底图：{map_path}，已阻止启动。"
-                )
-                return -1
-            self.img_map = load_image(map_path, cv2.IMREAD_COLOR)
+            self.img_map = load_image(f"minimaps/{map_name}/map.png",
+                                      cv2.IMREAD_COLOR)
+            self._report_load_stage("route", "正在加载并校验路线资源")
             # Load route*.png from minimaps/
             route_files = sorted(glob.glob(f"minimaps/{map_name}/route*.png"))
             route_files = [p for p in route_files if not p.endswith("route_rest.png")]
@@ -195,27 +322,99 @@ class MapleStoryAutoBot:
             if not self.img_routes:
                 logger.error(f"No route images found for map: {map_name}")
                 return -1
-            self.route_navigator = RouteNavigator(
-                self.img_routes,
-                self.color_code,
-                self.color_code_up_down,
-                search_range=cfg["route"]["search_range"],
-                event_rearm_distance=cfg["route"].get("event_rearm_distance", 5),
-                mount_search_range=cfg["route"].get("mount_search_range", 10),
-                mount_retry_frames=cfg["route"].get("mount_retry_frames", 5),
-                mount_success_distance=cfg["route"].get("mount_success_distance", 12),
-                mount_horizontal_tolerance=cfg["route"].get("mount_horizontal_tolerance", 6),
-            )
+            try:
+                semantic_routes = load_semantic_route_set(
+                    f"minimaps/{map_name}",
+                    map_id=map_name,
+                    canvas_size=(self.img_map.shape[1], self.img_map.shape[0]),
+                )
+            except SemanticRouteError as exc:
+                logger.error(f"[语义路线] 加载失败，已阻止启动：{exc}")
+                return -1
+            self.route_source = semantic_routes.source
+            if semantic_routes.source == "semantic":
+                if cfg["key"].get("teleport", "") == "" and any(
+                    segment["type"] == "teleport"
+                    for document in semantic_routes.documents
+                    for segment in document["segments"]
+                ):
+                    logger.error("[语义路线] 路线包含传送动作，但传送键为空。")
+                    return -1
+                self.route_navigator = SemanticRouteNavigator(
+                    semantic_routes.documents,
+                    ladder_align_tolerance=int(cfg["route"].get(
+                        "mount_horizontal_tolerance", 6
+                    )),
+                    ladder_retry_frames=int(cfg["route"].get(
+                        "mount_retry_frames", 5
+                    )),
+                    ladder_success_distance=int(cfg["route"].get(
+                        "mount_success_distance", 12
+                    )),
+                    ladder_max_attempts=int(cfg["route"].get(
+                        "mount_max_attempts", 5
+                    )),
+                    ladder_precision_tolerance=int(cfg["route"].get(
+                        "mount_precision_tolerance", 1
+                    )),
+                    ladder_settle_frames=int(cfg["route"].get(
+                        "mount_settle_frames", 2
+                    )),
+                    ladder_forward_hold_frames=int(cfg["route"].get(
+                        "mount_forward_hold_frames", 4
+                    )),
+                    ladder_retry_runup_distance=int(cfg["route"].get(
+                        "mount_retry_runup_distance", 8
+                    )),
+                    ladder_attempt_timeout=float(cfg["route"].get(
+                        "mount_attempt_timeout", 1.5
+                    )),
+                    ladder_confirm_frames=int(cfg["route"].get(
+                        "mount_confirm_frames", 3
+                    )),
+                    event_commit_seconds=float(cfg["route"].get(
+                        "traversal_commit_seconds", 0.45
+                    )),
+                )
+                logger.info(
+                    f"[语义路线] 已加载 {len(semantic_routes.documents)} 条有序路线。"
+                )
+            else:
+                self.route_navigator = RouteNavigator(
+                    self.img_routes,
+                    self.color_code,
+                    self.color_code_up_down,
+                    search_range=cfg["route"]["search_range"],
+                    event_rearm_distance=cfg["route"].get("event_rearm_distance", 5),
+                    mount_search_range=cfg["route"].get("mount_search_range", 10),
+                    mount_retry_frames=cfg["route"].get("mount_retry_frames", 5),
+                    mount_success_distance=cfg["route"].get("mount_success_distance", 12),
+                    mount_horizontal_tolerance=cfg["route"].get("mount_horizontal_tolerance", 6),
+                )
+                logger.info("[路线] 未发现 JSON，继续使用旧 PNG 执行器。")
 
 
         self.monster_detector = None
         self.monster_detection_times.clear()
+        self.monster_inference_times.clear()
         self.monster_frame_pipeline_times.clear()
+        self.visualization_compose_times.clear()
+        self.visualization_publish_times.clear()
+        self._report_load_stage("yolo", "正在加载 YOLO 部署和模型")
         detect_cfg = cfg["monster_detect"]
         try:
             self.monster_detector = OpenVinoMonsterDetector(
                 detect_cfg["openvino_deployment_root"],
                 confidence=float(detect_cfg.get("yolo_confidence", 0.25)),
+                min_monster_box_side=detect_cfg.get(
+                    "yolo_min_monster_box_side", 10
+                ),
+                player_exclusion_width=detect_cfg.get(
+                    "yolo_player_exclusion_width", 80
+                ),
+                player_exclusion_height=detect_cfg.get(
+                    "yolo_player_exclusion_height", 100
+                ),
                 max_det=RUNTIME_POLICY.yolo_max_det,
                 variant=detect_cfg.get("yolo_variant", "int8_v2"),
             )
@@ -227,62 +426,76 @@ class MapleStoryAutoBot:
             f"variant={self.monster_detector.variant} root={self.monster_detector.root}"
         )
 
-        profile_dir = f"nametag/{cfg['nametag']['name']}"
-        profile_path = f"{profile_dir}/profile.yaml"
-        samples = glob.glob(f"{profile_dir}/sample_*.png")
-        if not os.path.isfile(profile_path) or not samples:
-            logger.error(
-                f"[名字定位] 缺少 profile.yaml 或 sample_*.png：{profile_dir}"
-            )
-            return -1
+        self._report_load_stage("profile", "正在加载人物名字样本")
         try:
+            profile_repository = NameTagProfileRepository()
+            profile_name = cfg["nametag"]["name"]
+            profile_dir = profile_repository.resolve_profile(profile_name)
+            profile_repository.load_profile(profile_name, require_enabled=True)
             self.nametag_localizer = NameTagLocalizer.from_profile(profile_dir)
-        except (OSError, KeyError, TypeError, ValueError) as exc:
-            logger.error(f"[名字定位] 配置无效：{profile_dir}：{exc}")
+        except (KeyError, TypeError, ValueError, NameTagProfileError) as exc:
+            logger.error(f"[名字定位] 加载失败，已阻止启动：{exc}")
             return -1
         logger.info(f"Loaded name-tag profile: {profile_dir}")
 
-        login_button_path = (
-            f"misc/login_button_{RUNTIME_POLICY.client_language}.png"
-        )
-        if not os.path.isfile(login_button_path):
-            logger.error(
-                f"[界面识别] 缺少登录按钮模板：{login_button_path}，已阻止启动。"
+        if cfg["bot"]["mode"] != "continuous_attack":
+            self._report_load_stage("window", "正在加载游戏界面模板")
+            self.img_login_button = load_image(
+                f"misc/login_button_{RUNTIME_POLICY.client_language}.png"
             )
-            return -1
-        self.img_login_button = load_image(login_button_path)
-        cfg['ui_coords']['login_button_top_left'] = normalize_pixel_coordinate(
-            cfg['ui_coords']['login_button_top_left'], cfg['game_window']['size'])
-        cfg['ui_coords']['login_button_bottom_right'] = normalize_pixel_coordinate(
-            cfg['ui_coords']['login_button_bottom_right'], cfg['game_window']['size'])
+            cfg['ui_coords']['login_button_top_left'] = normalize_pixel_coordinate(
+                cfg['ui_coords']['login_button_top_left'], cfg['game_window']['size'])
+            cfg['ui_coords']['login_button_bottom_right'] = normalize_pixel_coordinate(
+                cfg['ui_coords']['login_button_bottom_right'], cfg['game_window']['size'])
+        else:
+            self.img_login_button = None
 
         # Print mode on log
         logger.info(f"[load_config] Config AutoBot as {cfg['bot']['mode']} mode")
 
         # Update cfg
         self.cfg = cfg
+        self._report_load_stage(None, "资源检查完成，等待当前画面识别")
 
         return 0 # load successfully
+
+    def _report_load_stage(self, key, detail):
+        sink = getattr(self, "load_status_sink", None)
+        if sink is not None:
+            sink(key, detail)
 
     def start(self):
         '''
         Start all threads
         '''
-        # Start keyboard controller thread
-        self.kb = KeyBoardController(self.cfg)
-        if self.is_disable_control:
-            self.kb.disable() # Disable keyboard controller for debugging
-
-        # Start game window capturing thread
+        previous_thread = getattr(self, "thread_auto_bot", None)
+        if previous_thread is not None and previous_thread.is_alive():
+            raise RuntimeError("上一次运行尚未安全退出，请稍后再启动。")
+        self.is_terminated = False
+        self.minimap_pose_tracker.reset()
+        self.minimap_pose_snapshot = self.minimap_pose_tracker.last_snapshot
+        self.run_generation += 1
+        run_generation = self.run_generation
+        # Resolve the exact target window before any input thread exists.
         if self.args.test_image == '':
             self.capture = GameWindowCapturor(self.cfg)
         else:
             self.capture = GameWindowCapturor(self.cfg, self.args.test_image)
 
+        # Start keyboard controller thread.  Live capture supplies the exact
+        # title used to resolve a stable HWND instead of a title substring.
+        target_window_title = self.capture.window_title or None
+        self.kb = KeyBoardController(
+            self.cfg,
+            target_window_title=target_window_title,
+            target_hwnd=getattr(self.capture, "window_hwnd", None),
+        )
+        if self.is_disable_control:
+            self.kb.disable() # Disable keyboard controller for debugging
+
         # Start health monitoring thread
         self.health_monitor = HealthMonitor(self.cfg, self.kb)
-        if self.cfg["health_monitor"]["enable"] and \
-            not self.is_disable_control:
+        if self.health_monitor.active:
             self.health_monitor.start()
 
         # Init profiler
@@ -299,19 +512,28 @@ class MapleStoryAutoBot:
         # Set init state
         if self.args.init_state != "":
             self.fsm.set_init_state(self.args.init_state) # For debugging
-        elif self.cfg["bot"]["mode"] == "aux":
-            self.fsm.set_init_state("aux")
-        elif self.cfg["bot"]["mode"] == "patrol":
-            self.fsm.set_init_state("patrol")
         else:
-            self.fsm.set_init_state("hunting")
+            self.set_state_for_configured_mode()
 
         # Start Auto Bot main thread
-        self.thread_auto_bot = threading.Thread(target=self.loop)
+        self.thread_auto_bot = threading.Thread(
+            target=self.loop,
+            args=(run_generation,),
+        )
         self.thread_auto_bot.start()
         self.is_first_frame = True
 
         logger.info("[MapleStoryAutoBot] Started")
+
+    def set_state_for_configured_mode(self):
+        """Enter the FSM state owned by the active main-program mode."""
+        state_name = {
+            "aux": "aux",
+            "patrol": "patrol",
+            "fixed_platform": "fixed_platform",
+            "continuous_attack": "continuous_attack",
+        }.get(self.cfg["bot"]["mode"], "hunting")
+        self.fsm.set_init_state(state_name)
 
     def pause(self):
         '''
@@ -328,6 +550,10 @@ class MapleStoryAutoBot:
         self.viz_mode = mode
         self.t_last_viz_frame = 0.0
         self.is_need_show_debug_window = True
+        if not hasattr(self, "_visualization_request"):
+            self._visualization_request = threading.Event()
+        self._visualization_request.clear()
+        self.request_visualization()
         logger.debug(f"[enable_viz] mode={mode}")
 
     def disable_viz(self):
@@ -336,22 +562,31 @@ class MapleStoryAutoBot:
         '''
         self.is_need_show_debug_window = False
         self.is_show_debug_window = False
+        self._frame_visualization_mode = None
+        if hasattr(self, "_visualization_request"):
+            self._visualization_request.clear()
         logger.debug("[disable_viz] is_show_debug_window = False")
 
     def is_viz_frame_due(self, now=None):
-        """Render every processed frame so Viz and control stay synchronized."""
-        # The main loop already enforces fps_limit_main. A second timer here
-        # caused uneven 4 FPS sampling and made the preview look frozen even
-        # while perception and control were still running.
-        return self.is_need_show_debug_window
+        """Return whether the current frontend has requested a fresh preview."""
+        if not self.is_need_show_debug_window:
+            return False
+        return (not getattr(self, "is_ui", False) or
+                getattr(self, "_visualization_request", threading.Event()).is_set())
 
     def get_player_location_by_nametag(self):
         """Return the player foot from the required calibrated name-tag profile."""
         if self.nametag_localizer is None:
             raise RuntimeError("名字定位器尚未初始化。")
+        # Name-tag search and health-bar extraction are different ROIs.  The
+        # classic client can place the player name below ui_y_start, so tying
+        # both features to that boundary silently makes the tag unreachable.
+        configured_limit = self.cfg.get("nametag", {}).get("search_y_limit", 0)
+        y_limit = int(configured_limit) if int(configured_limit) > 0 else \
+            int(self.cfg["ui_coords"]["ui_y_start"])
         result = self.nametag_localizer.locate(
             self.img_frame,
-            y_limit=self.cfg["ui_coords"]["ui_y_start"],
+            y_limit=min(y_limit, self.img_frame.shape[0]),
         )
         self.nametag_last_result = result
         if not result.valid:
@@ -374,19 +609,29 @@ class MapleStoryAutoBot:
         '''
         get_player_location_on_global_map
         '''
-        self.loc_minimap_global, score, _ = find_pattern_sqdiff(
-                                        self.img_map,
-                                        self.img_minimap)
-        self.localization_score = float(score)
-        if self.cfg["bot"].get("route_only") and self.localization_score > \
-                float(self.cfg["route"].get("localization_max_score", 0.20)):
-            return None
-
-        x_offset, y_offset = self.cfg["minimap"]["offset"]
-        loc_player_global = (
-            self.loc_minimap_global[0] + self.loc_player_minimap[0] + x_offset,
-            self.loc_minimap_global[1] + self.loc_player_minimap[1] + y_offset
+        self._diagnostic_map_checked = True
+        mask = np.any(self.img_minimap != [0, 0, 0], axis=2).astype(
+            np.uint8
+        ) * 255
+        snapshot = self.minimap_pose_tracker.update(
+            self.img_map,
+            self.img_minimap,
+            self.loc_player_minimap,
+            mask=mask,
+            offset=self.cfg["minimap"].get("offset", [0, 0]),
+            allow_large_jump=(
+                getattr(self, "last_route_intent", None) is not None
+                and self.last_route_intent.action == "teleport"
+            ),
         )
+        self.minimap_pose_snapshot = snapshot
+        self.localization_score = float(
+            snapshot.score if snapshot.score is not None else 1.0
+        )
+        if not snapshot.valid or snapshot.stable_position is None:
+            return None
+        self.loc_minimap_global = snapshot.camera_position
+        loc_player_global = snapshot.stable_position
 
         # Draw local minimap rectangle
         camera_bottom_right = (
@@ -398,7 +643,7 @@ class MapleStoryAutoBot:
                           camera_bottom_right, (0, 255, 255), 1)
             cv2.putText(
                 self.img_route_debug,
-                f"Minimap,score({round(score, 2)})",
+                f"Minimap,{snapshot.source},score({round(self.localization_score, 2)})",
                 (self.loc_minimap_global[0], self.loc_minimap_global[1]+15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.4,
                 (0, 255, 255), 1
@@ -461,51 +706,57 @@ class MapleStoryAutoBot:
                     }
                     min_dist_up_down = dist
 
-        # Debug
-        draw_rectangle(
-            self.img_route_debug,
-            (x_min, y_min),
-            (self.cfg["route"]["search_range"]*2,
-             self.cfg["route"]["search_range"]*2),
-            (0, 0, 255), "", text_height=0.4, thickness=1,
-        )
+        # Debug is strictly optional and must not allocate or affect routing.
+        if self.img_route_debug is not None:
+            draw_rectangle(
+                self.img_route_debug,
+                (x_min, y_min),
+                (self.cfg["route"]["search_range"]*2,
+                 self.cfg["route"]["search_range"]*2),
+                (0, 0, 255), "", text_height=0.4, thickness=1,
+            )
         # Draw a straigt line from map_loc_player to color_code["pixel"]
         if nearest is not None:
-            cv2.line(
-                self.img_route_debug,
-                self.loc_player_global, # start point
-                nearest["pixel"],       # end point
-                (0, 255, 0),            # green line
-                1                       # thickness
-            )
+            if self.img_route_debug is not None:
+                cv2.line(
+                    self.img_route_debug,
+                    self.loc_player_global,
+                    nearest["pixel"],
+                    (0, 255, 0),
+                    1,
+                )
             # Print color code on debug image
-            cv2.putText(
-                self.img_frame_debug, f"Route Action: {nearest['command']}",
-                (650, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255),
-                2, cv2.LINE_AA
-            )
-            cv2.putText(
-                self.img_frame_debug, f"Route Index: {self.idx_routes}",
-                (650, 90),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255),
-                2, cv2.LINE_AA
-            )
+            if self.img_frame_debug is not None:
+                cv2.putText(
+                    self.img_frame_debug, f"Route Action: {nearest['command']}",
+                    (650, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255),
+                    2, cv2.LINE_AA
+                )
+                cv2.putText(
+                    self.img_frame_debug, f"Route Index: {self.idx_routes}",
+                    (650, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255),
+                    2, cv2.LINE_AA
+                )
 
         if nearest_up_down is not None:
-            cv2.putText(
-                self.img_frame_debug, f"Route Action: {nearest_up_down['command']}",
-                (650, 60),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255),
-                2, cv2.LINE_AA
-            )
-            cv2.line(
-                self.img_route_debug,
-                self.loc_player_global,  # start point
-                nearest_up_down["pixel"],# end point
-                (0, 0, 255),             # green line
-                1                        # thickness
-            )
+            if self.img_frame_debug is not None:
+                cv2.putText(
+                    self.img_frame_debug,
+                    f"Route Action: {nearest_up_down['command']}",
+                    (650, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255),
+                    2, cv2.LINE_AA
+                )
+            if self.img_route_debug is not None:
+                cv2.line(
+                    self.img_route_debug,
+                    self.loc_player_global,
+                    nearest_up_down["pixel"],
+                    (0, 0, 255),
+                    1,
+                )
 
         return nearest, nearest_up_down  # if not found return none
 
@@ -586,29 +837,205 @@ class MapleStoryAutoBot:
                 (0, 0, 255), 1,
             )
 
-    def record_monster_frame_pipeline(self, started_at):
-        """Record capture-through-command time for the active YOLO frame."""
+    def draw_player_exclusion_debug(self, canvas=None):
+        """Draw the exact player-area filter used by the current YOLO frame."""
+        if canvas is None:
+            canvas = self.img_frame_debug
+        if (canvas is None or self.monster_detector is None or
+                not getattr(self, "current_nametag_valid", False)):
+            return
+        rect = self.monster_detector.player_exclusion_rect(
+            canvas.shape, self.loc_player
+        )
+        if rect is None:
+            return
+        x0, y0, x1, y1 = rect
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), (0, 165, 255), 2)
+
+    def draw_fixed_platform_debug(self, canvas=None):
+        """Draw fixed-platform bounds inside the existing minimap preview."""
+        if canvas is None:
+            canvas = self.img_frame_debug
+        if (canvas is None or self.cfg["bot"].get("mode") != "fixed_platform" or
+                self.img_minimap is None or self.img_minimap.size == 0):
+            return
+
+        diagnostics = self.fixed_platform_state.get_diagnostics()
+        minimap_x, minimap_y = self.loc_minimap
+        minimap_h, _ = self.img_minimap.shape[:2]
+        canvas_h, canvas_w = canvas.shape[:2]
+        top = min(max(0, int(minimap_y)), max(0, canvas_h - 1))
+        bottom = min(max(top, int(minimap_y + minimap_h - 1)), canvas_h - 1)
+
+        def draw_marker(local_x, color, thickness):
+            if local_x is None:
+                return
+            screen_x = min(
+                max(0, int(round(minimap_x + local_x))), canvas_w - 1
+            )
+            cv2.line(canvas, (screen_x, top), (screen_x, bottom), color, thickness)
+
+        draw_marker(diagnostics["left_x"], (0, 165, 255), 2)
+        draw_marker(diagnostics["right_x"], (0, 165, 255), 2)
+        draw_marker(diagnostics["anchor_x"], (255, 255, 0), 1)
+
+        if diagnostics["anchor_x"] is None:
+            status = "Fixed platform: waiting localization"
+            color = (0, 0, 255)
+        else:
+            state = "active" if diagnostics["localized"] else "waiting"
+            status = (
+                f"Fixed platform: {state} dir={diagnostics['direction']} "
+                f"range={diagnostics['left_x']}-{diagnostics['right_x']} "
+                f"width={diagnostics['actual_width']}/"
+                f"{diagnostics['requested_width']}"
+            )
+            color = (0, 255, 255) if diagnostics["localized"] else (0, 0, 255)
+        text_y = min(canvas_h - 5, max(15, bottom + 18))
+        cv2.putText(
+            canvas, status, (max(5, int(minimap_x)), text_y),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA,
+        )
+
+    def draw_continuous_attack_debug(self, canvas=None):
+        """Draw locked direction and timing without repeating inference."""
+        if canvas is None:
+            canvas = self.img_frame_debug
+        if (canvas is None or
+                self.cfg["bot"].get("mode") != "continuous_attack"):
+            return
+        diagnostics = self.continuous_attack_state.get_diagnostics()
+        direction = diagnostics["locked_direction"] or "waiting"
+        remaining = diagnostics["remaining_seconds"]
+        remaining_text = "--" if remaining is None else f"{remaining:.1f}s"
+        color = (0, 165, 255) if direction == "waiting" else (0, 255, 0)
+        lines = (
+            f"Continuous: phase={diagnostics['phase']}",
+            f"Locked direction: {direction} remaining={remaining_text}",
+            f"Healing priority: {diagnostics['healing']}",
+        )
+        for index, text in enumerate(lines):
+            cv2.putText(
+                canvas, text, (10, 400 + index * 23),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2,
+            )
+
+    def record_control_frame_pipeline(self, started_at):
+        """Record capture-through-command time, excluding optional preview work."""
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         self.monster_frame_pipeline_times.append(elapsed_ms)
 
+    @staticmethod
+    def _p95(samples):
+        values = np.asarray(samples, dtype=np.float64)
+        return float(np.percentile(values, 95)) if values.size else 0.0
+
+    def get_visualization_performance(self):
+        return {
+            "control_p95_ms": self._p95(
+                getattr(self, "monster_frame_pipeline_times", ())
+            ),
+            "infer_p95_ms": self._p95(
+                getattr(self, "monster_inference_times", ())
+            ),
+            "viz_p95_ms": self._p95(
+                getattr(self, "visualization_compose_times", ())
+            ),
+            "publish_p95_ms": self._p95(
+                getattr(self, "visualization_publish_times", ())
+            ),
+        }
+
+    @staticmethod
+    def _resize_preview(image, max_width, interpolation):
+        if image is None or image.size == 0:
+            return None
+        height, width = image.shape[:2]
+        if width <= max_width:
+            return np.ascontiguousarray(image)
+        target_height = max(1, round(height * max_width / width))
+        return cv2.resize(
+            image, (max_width, target_height), interpolation=interpolation
+        )
+
+    def _prepare_visualization_buffers(self):
+        """Allocate only the debug buffer requested for this control frame."""
+        mode = self._frame_visualization_mode
+        self.img_frame_debug = (
+            self.img_frame.copy() if mode in {"game", "both"} else None
+        )
+        self.img_route_debug = (
+            cv2.cvtColor(self.img_route, cv2.COLOR_RGB2BGR)
+            if mode in {"route", "both"} and self.img_route is not None
+            else None
+        )
+
     def get_frame_debug_for_viz(self):
-        """Compose overlays while preserving the captured BGR colour frame."""
+        """Compose the requested game preview once on its dedicated copy."""
         if self.img_frame_debug is None:
             return None
-        canvas = self.img_frame_debug.copy()
+        source_canvas = self.img_frame_debug
+        is_ui_preview = getattr(self, "is_ui", False)
+        # UI previews are composed exactly once.  The standalone debug runner
+        # may ask for the same frame repeatedly, so keep its canvas immutable.
+        canvas = (
+            source_canvas if is_ui_preview else source_canvas.copy()
+        )
         if canvas.ndim == 2:
             canvas = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
         elif canvas.ndim != 3 or canvas.shape[2] != 3:
             logger.error(f"[Viz] Unsupported debug frame shape: {canvas.shape}")
             return None
-        if self.loc_player is not None:
+        if is_ui_preview:
+            self.img_frame_debug = canvas
+            if hasattr(self, "t_last_frame"):
+                self.update_info_on_img_frame_debug()
+        elif hasattr(self, "t_last_frame"):
+            self.img_frame_debug = canvas
+            try:
+                self.update_info_on_img_frame_debug()
+            finally:
+                self.img_frame_debug = source_canvas
+        can_draw_detection = self.loc_player is not None
+        if (self.cfg["bot"].get("mode") == "fixed_platform" and
+                not self.current_nametag_valid):
+            can_draw_detection = False
+        if self.cfg["bot"].get("mode") == "continuous_attack":
+            # The lock frame may show the boxes that established direction.
+            # The next frame clears current_nametag_valid and all detections,
+            # so this never paints a stale startup observation.
+            can_draw_detection = self.current_nametag_valid
+        if can_draw_detection:
             x0, y0, x1, y1 = self.get_monster_search_range()
             self.draw_monster_detection_debug(
                 (x0, y0), (x1, y1), self.monsters, canvas=canvas
             )
-        self.draw_combat_ranges_debug(canvas)
-        return np.ascontiguousarray(
-            canvas[:self.cfg["ui_coords"]["ui_y_start"], :]
+        if self.cfg["bot"].get("mode") != "continuous_attack" or \
+                can_draw_detection:
+            self.draw_combat_ranges_debug(canvas)
+            self.draw_player_exclusion_debug(canvas)
+        self.draw_fixed_platform_debug(canvas)
+        self.draw_continuous_attack_debug(canvas)
+        self.draw_ladder_execution_debug(canvas)
+        return self._resize_preview(
+            canvas,
+            RUNTIME_POLICY.preview_max_width,
+            cv2.INTER_AREA,
+        )
+
+    def get_route_debug_for_viz(self):
+        """Scale the requested route preview without touching the game frame."""
+        if self.img_route_debug is None:
+            return None
+        scale = float(self.cfg["minimap"]["debug_window_upscale"])
+        image = self.img_route_debug
+        if scale != 1.0:
+            image = cv2.resize(
+                image, (0, 0), fx=scale, fy=scale,
+                interpolation=cv2.INTER_NEAREST,
+            )
+        return self._resize_preview(
+            image, RUNTIME_POLICY.preview_max_width, cv2.INTER_NEAREST
         )
 
     def _ensure_route_combat_state(self):
@@ -833,34 +1260,33 @@ class MapleStoryAutoBot:
                 )
 
         timing = detector.last_timing if detector is not None else None
-        samples = np.asarray(self.monster_detection_times, dtype=np.float64)
-        frame_samples = np.asarray(
-            self.monster_frame_pipeline_times, dtype=np.float64
-        )
-        mean_ms = float(np.mean(samples)) if samples.size else 0.0
-        p95_ms = float(np.percentile(samples, 95)) if samples.size else 0.0
-        frame_p95_ms = (
-            float(np.percentile(frame_samples, 95))
-            if frame_samples.size else 0.0
-        )
+        performance = self.get_visualization_performance()
         timing_text = (
             f"YOLO: monsters={timing.monsters} players={timing.players} "
             f"crop={timing.crop_ms:.1f} infer={timing.infer_ms:.1f} "
-            f"convert={timing.convert_ms:.1f} total={timing.total_ms:.1f}ms "
-            f"mean={mean_ms:.1f} p95={p95_ms:.1f} "
-            f"frame_p95={frame_p95_ms:.1f}"
+            f"convert={timing.convert_ms:.1f} total={timing.total_ms:.1f}ms"
             if timing is not None else "YOLO: not initialized"
+        )
+        performance_text = (
+            f"control_p95={performance['control_p95_ms']:.1f}ms "
+            f"infer_p95={performance['infer_p95_ms']:.1f}ms "
+            f"viz_p95={performance['viz_p95_ms']:.1f}ms"
         )
         cv2.putText(
             canvas, timing_text,
-            (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            (10, 350), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            (0, 255, 255), 2,
+        )
+        cv2.putText(
+            canvas, performance_text,
+            (10, 375), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
             (0, 255, 255), 2,
         )
         cv2.putText(
             canvas,
             "Attack direction (observe only): "
             f"{getattr(self, 'debug_attack_direction', 'none')}",
-            (10, 485), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            (10, 400), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
             (0, 255, 255), 2,
         )
 
@@ -869,7 +1295,21 @@ class MapleStoryAutoBot:
         get_img_frame
         '''
         # Get window game raw frame
-        self.frame = self.capture.get_frame()
+        if hasattr(self.capture, "get_frame_packet"):
+            packet = self.capture.get_frame_packet()
+            if packet is None:
+                self.frame = None
+                self.frame_captured_at = 0.0
+                self.capture_frame_sequence = None
+            else:
+                (self.frame, self.frame_captured_at,
+                 self.capture_frame_sequence) = packet
+        else:
+            self.frame = self.capture.get_frame()
+            self.frame_captured_at = (
+                time.monotonic() if self.frame is not None else 0.0
+            )
+            self.capture_frame_sequence = None
         if self.frame is None:
             logger.warning("Failed to capture game frame.")
             return
@@ -991,8 +1431,11 @@ class MapleStoryAutoBot:
         '''
         update_info_on_img_frame_debug
         '''
+        if self.img_frame_debug is None:
+            return
         # Print text at bottom left corner
-        self.fps = round(1.0 / (time.time() - self.t_last_frame))
+        elapsed = max(time.time() - self.t_last_frame, 1e-6)
+        self.fps = round(1.0 / elapsed)
         text_y_interval = 23
         text_y_start = 460
         h, w = self.frame.shape[:2]
@@ -1010,7 +1453,9 @@ class MapleStoryAutoBot:
                 2, cv2.LINE_AA
             )
 
-        self.draw_combat_ranges_debug()
+        self.draw_health_monitor_debug()
+        if self.cfg["bot"]["mode"] == "continuous_attack":
+            return
 
         # Draw minimap rectangle on img debug
         draw_rectangle(
@@ -1020,23 +1465,26 @@ class MapleStoryAutoBot:
             (0, 0, 255), "minimap",thickness=2
         )
 
-        # Don't draw minimap in patrol mode
-        if self.cfg["bot"]["mode"] in ["patrol", "aux"]:
+        # Modes without a route image stop after drawing the live minimap.
+        if self.cfg["bot"]["mode"] in ["patrol", "aux", "fixed_platform"]:
             return
 
         # Compute crop region with boundary check
         crop_w, crop_h = 80, 80
         x0 = max(0, self.loc_player_global[0] - crop_w // 2)
         y0 = max(0, self.loc_player_global[1] - crop_h // 2)
-        x1 = min(self.img_route_debug.shape[1], x0 + crop_w)
-        y1 = min(self.img_route_debug.shape[0], y0 + crop_h)
+        route_h, route_w = self.img_route.shape[:2]
+        x1 = min(route_w, x0 + crop_w)
+        y1 = min(route_h, y0 + crop_h)
 
         # Check if valid crop region
         if x1 <= x0 or y1 <= y0:
             return
 
         # Crop region
-        mini_map_crop = self.img_route_debug[y0:y1, x0:x1]
+        mini_map_crop = cv2.cvtColor(
+            self.img_route[y0:y1, x0:x1], cv2.COLOR_RGB2BGR
+        )
         mini_map_crop = cv2.resize(mini_map_crop,
                                 (int(mini_map_crop.shape[1] * 3),
                                  int(mini_map_crop.shape[0] * 3)),
@@ -1057,33 +1505,72 @@ class MapleStoryAutoBot:
             thickness=2
         )
 
-        # Draw HP/MP/EXP bar on debug window
-        percent_bars = [self.health_monitor.hp_percent,
-                      self.health_monitor.mp_percent,
-                      self.health_monitor.exp_percent]
-        for i, bar_name in enumerate(["HP", "MP", "EXP"]):
-            x_s, y_s = (250, 30)
-            # Print bar ratio on debug window
-            cv2.putText(self.img_frame_debug,
-                        f"{bar_name}: {percent_bars[i]:.1f}%",
-                        (x_s, y_s + 30*i),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2)
-            # Draw bar on debug window
-            x_s, y_s = (410, 13)
-            x, y, w, h = self.health_monitor.loc_size_bars[i]
-            self.img_frame_debug[y_s+30*i:y_s+h+30*i, x_s:x_s+w] = \
-                self.img_frame[self.cfg["ui_coords"]["ui_y_start"]:, :][y:y+h, x:x+w]
-
         # Print command on screen
         cv2.putText(self.img_frame_debug, f"Cmd: {self.cmd_move_x} {self.cmd_move_y} {self.cmd_action}",
                     (10, 430), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+
+    def draw_health_monitor_debug(self):
+        """Render one internally consistent health snapshot on game preview."""
+        health_monitor = getattr(self, "health_monitor", None)
+        if (self.img_frame_debug is None or health_monitor is None or
+                not health_monitor.active):
+            return
+        snapshot = health_monitor.get_snapshot()
+        values = (
+            snapshot.hp_percent, snapshot.mp_percent, snapshot.exp_percent
+        )
+        rects = (snapshot.hp_rect, snapshot.mp_rect, snapshot.exp_rect)
+        colors = ((0, 0, 255), (255, 0, 0), (0, 255, 255))
+        frame_h, frame_w = self.img_frame_debug.shape[:2]
+        origin_x, origin_y = snapshot.roi_origin
+
+        if snapshot.state == "CALIBRATING":
+            search_y = min(max(0, origin_y), frame_h - 1)
+            cv2.rectangle(
+                self.img_frame_debug, (0, search_y),
+                (frame_w - 1, frame_h - 1), (0, 165, 255), 1,
+            )
+
+        for index, (bar_name, value, rect, color) in enumerate(zip(
+                ("HP", "MP", "EXP"), values, rects, colors)):
+            value_text = "--" if value is None else f"{value:.1f}%"
+            cv2.putText(
+                self.img_frame_debug, f"{bar_name}: {value_text}",
+                (250, 30 + 30 * index), cv2.FONT_HERSHEY_SIMPLEX,
+                0.8, color, 2,
+            )
+            if rect is None:
+                continue
+            x, y, width, height = rect
+            x0 = max(0, origin_x + x)
+            y0 = max(0, origin_y + y)
+            x1 = min(frame_w, origin_x + x + width)
+            y1 = min(frame_h, origin_y + y + height)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            cv2.rectangle(
+                self.img_frame_debug, (x0, y0), (x1 - 1, y1 - 1), color, 2
+            )
+            bar = self.img_frame[y0:y1, x0:x1]
+            paste_x, paste_y = 410, 13 + 30 * index
+            paste_x1 = paste_x + bar.shape[1]
+            paste_y1 = paste_y + bar.shape[0]
+            if paste_x1 <= frame_w and paste_y1 <= frame_h:
+                self.img_frame_debug[paste_y:paste_y1, paste_x:paste_x1] = bar
+
+        cv2.putText(
+            self.img_frame_debug,
+            f"Health: {snapshot.state} conf={snapshot.confidence:.2f} "
+            f"reason={snapshot.reason}",
+            (250, 125), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+            (0, 165, 255), 1, cv2.LINE_AA,
+        )
 
     def update_img_frame_debug(self):
         '''
         update_img_frame_debug
         '''
-        cv2.imshow("Game Window Debug",
-            self.img_frame_debug[:self.cfg["ui_coords"]["ui_y_start"], :])
+        cv2.imshow("Game Window Debug", self.img_frame_debug)
         # Update FPS timer
         self.t_last_frame = time.time()
 
@@ -1134,28 +1621,58 @@ class MapleStoryAutoBot:
         self.kb.set_command("none none none")
         self.kb.release_all_key()
 
-        self.fsm.set_init_state("hunting")
+        self.set_state_for_configured_mode()
         self.t_last_attack = time.time() # Update timer
 
     def terminate_threads(self):
         '''
         terminate all threads
         '''
-        # Terminate keyboard controller
+        # Publish the caller-owned stop intent before terminating KBC.  This
+        # prevents the worker loop from misreporting a normal F1 pause/close as
+        # an unexpected runtime stop while both threads are winding down.
+        self.is_terminated = True
+        # Close the input gate first. Health recognition may be blocked in an
+        # in-flight frame, so waiting for it before releasing movement keys
+        # would leave the character controllable during an F1 pause.
         if self.kb is not None:
             # Safety stop is synchronous: do not wait for the controller
             # thread's next iteration to release a held direction key.
             self.kb.set_command("none none none")
-            self.kb.release_all_key()
-            self.kb.is_terminated = True
+            if hasattr(self.kb, "terminate"):
+                self.kb.terminate()
+            else:
+                if hasattr(self.kb, "clear_aux_actions"):
+                    self.kb.clear_aux_actions()
+                self.kb.release_all_key()
+                self.kb.is_terminated = True
+        # With input synchronously closed, wait for recovery production to end.
+        if self.health_monitor is not None:
+            self.health_monitor.stop()
         # Terminate game window capturor
         if self.capture is not None:
             self.capture.stop()
-        # Terminate health monitor
-        if self.health_monitor is not None:
-            self.health_monitor.stop()
-        self.is_terminated = True
+        worker = getattr(self, "thread_auto_bot", None)
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=1.0)
+            if worker.is_alive():
+                logger.warning(
+                    "[terminate_threads] 主控制线程仍在退出；退出前将阻止重新启动。"
+                )
         logger.info(f"[terminate_threads] Terminated all threads")
+
+    def request_return_home(self, source="watchdog"):
+        """Queue return-home through the same guarded input path as recovery."""
+        self.kb.set_command("none none none")
+        accepted = self.kb.request_aux_action(
+            "return_home",
+            source_sequence=int(getattr(self, "control_frame_sequence", 0)),
+            requested_at=time.monotonic(),
+            priority="emergency",
+        )
+        if accepted:
+            logger.info(f"[ReturnHome] Queued safely from {source}.")
+        return accepted
 
     def get_attack_direction(self, monster_left, monster_right):
         '''
@@ -1302,8 +1819,9 @@ class MapleStoryAutoBot:
         img_roi = self.img_frame[y0:y1, x0:x1]
 
         # Draw rectange on debug image
-        draw_rectangle(self.img_frame_debug, (x0, y0),
-                       (y1-y0, x1-x0), (0, 255, 0), "login_button box")
+        if self.img_frame_debug is not None:
+            draw_rectangle(self.img_frame_debug, (x0, y0),
+                           (y1-y0, x1-x0), (0, 255, 0), "login_button box")
 
         # Find the 'login' button
         loc, score, _ = find_pattern_sqdiff(
@@ -1323,7 +1841,10 @@ class MapleStoryAutoBot:
         navigator = getattr(self, "route_navigator", None)
         pending_mount = bool(
             navigator is not None and
-            getattr(navigator, "has_pending_traversal", False)
+            (
+                getattr(navigator, "has_pending_traversal", False)
+                or getattr(navigator, "requires_route_exclusive_control", False)
+            )
         )
         if (pending_mount or getattr(self, "is_on_ladder", False) or
                 now < self.route_commit_until):
@@ -1348,13 +1869,63 @@ class MapleStoryAutoBot:
             route_intent.move_y
 
     def update_cmd_by_route(self):
-        if self.cfg["bot"].get("route_only"):
-            decision = self.route_navigator.decide(self.loc_player_global)
+        if (
+            isinstance(self.route_navigator, SemanticRouteNavigator)
+            or self.cfg["bot"].get("route_only")
+        ):
+            if isinstance(self.route_navigator, SemanticRouteNavigator):
+                decision = self.route_navigator.decide(
+                    self.loc_player_global,
+                    is_on_ladder=self.is_on_ladder,
+                    suspend_traversal=bool(
+                        getattr(self, "kb", None) is not None
+                        and self.kb.is_need_force_heal
+                    ),
+                )
+            else:
+                decision = self.route_navigator.decide(self.loc_player_global)
             self.idx_routes = self.route_navigator.route_index
             self.cmd_move_x, self.cmd_move_y, self.cmd_action = decision.command.split()
             self.last_route_intent = RouteIntent.from_command(
                 decision.command, reason=decision.reason
             )
+            if decision.reason.startswith("semantic_ladder_retry_"):
+                diagnostics = self.route_navigator.diagnostics
+                segment = self.route_navigator._segment
+                logger.warning(
+                    "[语义路线] 挂梯尝试失败，准备重新对位："
+                    f"route={diagnostics.route_index + 1} "
+                    f"segment={segment.get('id')} "
+                    f"attempt={diagnostics.ladder_attempts}/"
+                    f"{self.route_navigator.ladder_max_attempts} "
+                    f"reason={decision.reason.removeprefix('semantic_ladder_retry_')} "
+                    f"direction={diagnostics.mount_direction} "
+                    f"player={self.loc_player_global} "
+                    f"approach={segment.get('approach')} "
+                    f"mount={segment.get('mount')}"
+                    f" candidate={self.route_navigator.ladder_debug.get('candidate_mount')}"
+                    f" offset={self.route_navigator.ladder_debug.get('candidate_offset')}"
+                )
+            if (decision.reason == "semantic_ladder_failed" and
+                    getattr(self, "kb", None) is not None):
+                diagnostics = self.route_navigator.diagnostics
+                segment = self.route_navigator._segment
+                logger.error(
+                    "[语义路线] 挂梯连续失败，已安全停止："
+                    f"route={diagnostics.route_index + 1} "
+                    f"segment={segment.get('id')} "
+                    f"direction={diagnostics.mount_direction} "
+                    f"player={self.loc_player_global} "
+                    f"approach={segment.get('approach')} "
+                    f"mount={segment.get('mount')} "
+                    f"candidate={self.route_navigator.ladder_debug.get('candidate_mount')} "
+                    f"offset={self.route_navigator.ladder_debug.get('candidate_offset')} "
+                    f"attempts={diagnostics.ladder_attempts}"
+                )
+                self.kb.set_command("stop stop none")
+                self.kb.release_all_key()
+                self.kb.termination_reason = "route_ladder_failed"
+                self.kb.terminate()
             return self.last_route_intent
         # get color code from img_route
         color_code, color_code_up_down = self.get_nearest_color_code()
@@ -1398,6 +1969,105 @@ class MapleStoryAutoBot:
         )
         return self.last_route_intent
 
+    def draw_route_execution_debug(self):
+        """Render cached route progress without adding another update loop."""
+        if self.img_route_debug is None or self.route_navigator is None:
+            return
+        diagnostics = getattr(self.route_navigator, "diagnostics", None)
+        if diagnostics is None:
+            text = f"Route: {self.idx_routes + 1} source=legacy"
+        else:
+            text = (
+                f"Route: {diagnostics.route_index + 1} "
+                f"segment={diagnostics.segment_index + 1} "
+                f"point={diagnostics.point_index + 1} "
+                f"traversal={diagnostics.traversal_state} "
+                f"reason={diagnostics.reason}"
+            )
+        cv2.putText(
+            self.img_route_debug, text, (5, 14),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1,
+        )
+        pose = getattr(self, "minimap_pose_snapshot", None)
+        if pose is not None:
+            pose_text = (
+                f"Pose raw={pose.raw_position} stable={pose.stable_position} "
+                f"score={pose.score} src={pose.source} reason={pose.reason}"
+            )
+            cv2.putText(
+                self.img_route_debug, pose_text, (5, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 0), 1,
+            )
+        ladder = getattr(self.route_navigator, "ladder_debug", None)
+        if ladder is not None:
+            cv2.circle(
+                self.img_route_debug, ladder["approach"], 3,
+                (0, 255, 255), 1, cv2.LINE_8,
+            )
+            cv2.circle(
+                self.img_route_debug, ladder["mount"], 4,
+                (0, 165, 255), 1, cv2.LINE_8,
+            )
+            cv2.circle(
+                self.img_route_debug, ladder.get("candidate_mount", ladder["mount"]), 5,
+                (255, 255, 0), 1, cv2.LINE_8,
+            )
+            detail = (
+                f"Ladder: {ladder['stage']} dir={ladder['mount_direction']} "
+                f"dx={ladder['align_error']} settle={ladder['settle_frames']} "
+                f"try={ladder['attempts']}/{ladder['max_attempts']} "
+                f"off={ladder.get('candidate_offset', 0)} "
+                f"pulse={ladder.get('pulse_count', 0)} "
+                f"rise={ladder.get('max_rise', 0)} "
+                f"cache={ladder.get('cached_offset')}"
+            )
+            cv2.putText(
+                self.img_route_debug, detail, (5, 46),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1,
+            )
+
+    def draw_ladder_execution_debug(self, canvas=None):
+        """Draw the active semantic ladder stage on the game minimap."""
+        if canvas is None:
+            canvas = self.img_frame_debug
+        navigator = getattr(self, "route_navigator", None)
+        ladder = getattr(navigator, "ladder_debug", None)
+        if (canvas is None or ladder is None or self.img_minimap is None or
+                self.img_minimap.size == 0):
+            return
+        offset_x, offset_y = self.cfg["minimap"].get("offset", [0, 0])
+        minimap_h, minimap_w = self.img_minimap.shape[:2]
+
+        def to_screen(point):
+            local_x = int(point[0]) - int(self.loc_minimap_global[0]) - int(offset_x)
+            local_y = int(point[1]) - int(self.loc_minimap_global[1]) - int(offset_y)
+            if not (0 <= local_x < minimap_w and 0 <= local_y < minimap_h):
+                return None
+            return int(self.loc_minimap[0]) + local_x, int(self.loc_minimap[1]) + local_y
+
+        approach = to_screen(ladder["approach"])
+        mount = to_screen(ladder["mount"])
+        candidate_mount = to_screen(ladder.get("candidate_mount", ladder["mount"]))
+        if approach is not None:
+            cv2.circle(canvas, approach, 4, (0, 255, 255), 1, cv2.LINE_8)
+        if mount is not None:
+            cv2.circle(canvas, mount, 5, (0, 165, 255), 1, cv2.LINE_8)
+        if candidate_mount is not None:
+            cv2.circle(canvas, candidate_mount, 6, (255, 255, 0), 1, cv2.LINE_8)
+        detail = (
+            f"Ladder {ladder['stage']} dir={ladder['mount_direction']} "
+            f"dx={ladder['align_error']} settle={ladder['settle_frames']} "
+            f"try={ladder['attempts']}/{ladder['max_attempts']} "
+            f"off={ladder.get('candidate_offset', 0)} "
+            f"pulse={ladder.get('pulse_count', 0)} "
+            f"rise={ladder.get('max_rise', 0)} "
+            f"cache={ladder.get('cached_offset')}"
+        )
+        cv2.putText(
+            canvas, detail, (10, 470), cv2.FONT_HERSHEY_SIMPLEX,
+            0.5, (0, 165, 255), 1, cv2.LINE_AA,
+        )
+
     def update_monster_observations(self):
         """Refresh detector output without granting either subsystem control."""
         detection_only = self.is_disable_control
@@ -1405,11 +2075,24 @@ class MapleStoryAutoBot:
 
         if self.monster_detector is None:
             raise RuntimeError("YOLO 怪物检测器尚未初始化。")
-        self.monsters = self.monster_detector.detect(
-            self.img_frame, self.loc_player
-        )
+        if getattr(self, "current_nametag_valid", False):
+            self.monsters = self.monster_detector.detect(
+                self.img_frame,
+                self.loc_player,
+                player_exclusion_anchor=self.loc_player,
+            )
+        else:
+            # Keep the historical detector call compatible while explicitly
+            # withholding a stale name-tag anchor from the exclusion filter.
+            self.monsters = self.monster_detector.detect(
+                self.img_frame, self.loc_player
+            )
+        self._diagnostic_yolo_checked = True
         timing = self.monster_detector.last_timing
         self.monster_detection_times.append(timing.total_ms)
+        if not hasattr(self, "monster_inference_times"):
+            self.monster_inference_times = deque(maxlen=300)
+        self.monster_inference_times.append(timing.infer_ms)
 
         if detection_only:
             now = time.time()
@@ -1421,7 +2104,7 @@ class MapleStoryAutoBot:
                 frame_samples = np.asarray(
                     self.monster_frame_pipeline_times, dtype=np.float64
                 )
-                frame_p95_ms = (
+                control_p95_ms = (
                     float(np.percentile(frame_samples, 95))
                     if frame_samples.size else 0.0
                 )
@@ -1431,7 +2114,7 @@ class MapleStoryAutoBot:
                     f"crop={timing.crop_ms:.2f}ms infer={timing.infer_ms:.2f}ms "
                     f"convert={timing.convert_ms:.2f}ms total={timing.total_ms:.2f}ms "
                     f"mean={mean_ms:.2f}ms p95={p95_ms:.2f}ms "
-                    f"frame_p95={frame_p95_ms:.2f}ms"
+                    f"control_p95={control_p95_ms:.2f}ms"
                 )
                 self.t_last_mob_score_log = now
 
@@ -1575,6 +2258,7 @@ class MapleStoryAutoBot:
             return route_intent, combat_intent
 
         route_reference = self.last_route_intent
+        previous_combat_owned = self.last_combat_intent.owns_control
         combat_intent = self.build_route_combat_intent(
             route_reference, now=now, control_allowed=True
         )
@@ -1589,6 +2273,12 @@ class MapleStoryAutoBot:
             )
             return None, combat_intent
 
+        if previous_combat_owned and isinstance(
+            self.route_navigator, SemanticRouteNavigator
+        ):
+            self.route_navigator.request_reacquire(
+                "semantic_combat_resume_reacquire"
+            )
         route_intent = self.update_cmd_by_route()
         self.mark_route_traversal_commit(route_intent, now=now)
         self.apply_route_combat_intent(
@@ -1608,6 +2298,10 @@ class MapleStoryAutoBot:
 
     def check_reach_goal(self):
         if self.cmd_action == "goal":
+            if isinstance(self.route_navigator, SemanticRouteNavigator):
+                # The ordered navigator advanced atomically when it emitted
+                # the Goal intent; advancing again here would skip a route.
+                return
             # Switch to next route map
             self.idx_routes = (self.idx_routes+1)%len(self.img_routes)
             logger.debug(f"Change to new route:{self.idx_routes}")
@@ -1615,24 +2309,109 @@ class MapleStoryAutoBot:
     def pause_for_visual(self, reason):
         """Stop physical movement while retaining the route for safe recovery."""
         self.last_visual_pause_reason = reason
+        self._diagnostic_pause_reason = reason
         self.reset_route_combat()
         self.route_commit_until = 0.0
+        if isinstance(self.route_navigator, SemanticRouteNavigator):
+            self.route_navigator.suspend_traversal()
+            if not self.route_navigator.requires_route_exclusive_control:
+                self.route_navigator.request_reacquire(
+                    f"semantic_visual_resume_{reason}"
+                )
         self.route_commit_kind = None
         self.cmd_move_x, self.cmd_move_y, self.cmd_action = "stop", "stop", "none"
         if self.kb is not None:
             self.kb.set_command("stop stop none")
             self.kb.release_all_key()
 
+    def _update_health_monitor_frame(self):
+        """Publish one owned bottom-UI ROI to the health worker."""
+        if self.health_monitor is None or not self.health_monitor.active:
+            return
+        ui_y_start = self.cfg["ui_coords"]["ui_y_start"]
+        health_roi = self.img_frame[ui_y_start:, :]
+        self.health_monitor.update_frame(
+            health_roi,
+            frame_sequence=(
+                self.capture_frame_sequence
+                if self.capture_frame_sequence is not None
+                else self.control_frame_sequence
+            ),
+            roi_origin=(0, ui_y_start),
+            captured_at=self.frame_captured_at,
+        )
+
+    def _run_continuous_attack_frame(self):
+        """Run only the one-time perception needed to lock attack direction."""
+        state = self.continuous_attack_state
+        was_locked = state.direction_locked
+        if was_locked:
+            # Never display or reuse the startup detections after direction is
+            # locked. The state keeps only the selected direction/diagnostics.
+            self.monsters = []
+            self.current_nametag_valid = False
+        else:
+            loc_player = self.get_player_location_by_nametag()
+            self.current_nametag_valid = loc_player is not None
+            if loc_player is not None:
+                self.loc_player = loc_player
+                if self.img_frame_debug is not None:
+                    cv2.circle(
+                        self.img_frame_debug,
+                        self.loc_player,
+                        radius=3,
+                        color=(0, 0, 255),
+                        thickness=-1,
+                    )
+            else:
+                self.monsters = []
+
+        self.last_visual_pause_reason = ""
+        self.fsm.do_state_stuff()
+        self.is_first_frame = False
+        self.profiler.mark("Continuous directional attack")
+        return 0
+
     def run_once(self):
+        # Diagnostic delivery is independent of debug rendering and never changes
+        # navigation decisions. Publish one immutable latest snapshot, not a Qt
+        # event containing a full-sized image for every control frame.
+        enabled = getattr(self, "diagnostics_enabled", False)
+        if enabled:
+            self._diagnostic_frame_valid = False
+            self._diagnostic_map_checked = False
+            self._diagnostic_yolo_checked = False
+            self._diagnostic_pause_reason = ""
+            self.nametag_last_result = None
+        try:
+            return self._run_once()
+        finally:
+            now = time.monotonic()
+            if enabled and now - getattr(self, "_diagnostic_published_at", 0) >= .2:
+                try:
+                    from src.engine.ReadinessDiagnostics import runtime_report
+                    self.readiness_report = runtime_report(self, self._diagnostic_frame_valid)
+                    self._diagnostic_published_at = now
+                except Exception as exc:
+                    # Diagnostics must not mask a control-loop failure.
+                    logger.warning(f"[识别状态] 无法生成诊断：{exc}")
+
+    def _run_once(self):
         '''
         Process one game window frame
         '''
-        frame_pipeline_started = time.perf_counter()
         # Start profiler for performance debugging
         self.profiler.start()
+        # These flags describe this exact control frame.  Fixed-platform mode
+        # fails closed instead of reusing stale coordinates from a prior frame.
+        self.current_minimap_roi_valid = False
+        self.current_minimap_player_valid = False
+        self.current_nametag_valid = False
 
-        # Check if need viz window
-        self.is_show_debug_window = self.is_viz_frame_due()
+        # A UI request is a one-shot token.  Only the selected preview is
+        # allocated on this control frame.
+        self._frame_visualization_mode = self._claim_visualization_mode()
+        self.is_show_debug_window = self._frame_visualization_mode is not None
         if not self.is_show_debug_window:
             self.img_frame_debug = None
             self.img_route_debug = None
@@ -1649,21 +2428,24 @@ class MapleStoryAutoBot:
             return -1 # Wait for game window to be ready
         else:
             self.img_frame = img_frame
-
-        # Grayscale game window
-        self.img_frame_gray = cv2.cvtColor(self.img_frame, cv2.COLOR_BGR2GRAY)
-
-        # Image for debug viz
-        if self.is_show_debug_window:
-            self.img_frame_debug = self.img_frame.copy()
+            self._diagnostic_frame_valid = True
+            self.control_frame_sequence += 1
 
         # Get current route image
         if self.cfg["bot"]["mode"] == "normal":
             self.img_route = self.img_routes[self.idx_routes]
-            if self.is_show_debug_window:
-                self.img_route_debug = cv2.cvtColor(self.img_route, cv2.COLOR_RGB2BGR)
+        else:
+            self.img_route = None
+        self._prepare_visualization_buffers()
 
         self.profiler.mark("Image Preprocessing")
+
+        # Health monitoring remains active in the lightweight continuous-
+        # attack path and receives this frame before any optional perception.
+        self._update_health_monitor_frame()
+
+        if self.cfg["bot"]["mode"] == "continuous_attack":
+            return self._run_continuous_attack_frame()
 
         ###################
         ### Get Minimap ###
@@ -1696,12 +2478,17 @@ class MapleStoryAutoBot:
             # update minimap image
             self.loc_minimap = (x, y)
             self.img_minimap = self.img_frame[y:y+h, x:x+w]
+            self.current_minimap_roi_valid = True
             self.t_last_minimap_update = time.time()
+            if not self._minimap_roi_pixels_logged:
+                logger.info(
+                    f"[小地图ROI] source={self.minimap_roi_source} "
+                    f"pixels=({x}, {y}, {w}, {h}) "
+                    f"frame={self.img_frame.shape[1]}x{self.img_frame.shape[0]}"
+                )
+                self._minimap_roi_pixels_logged = True
 
         self.profiler.mark("Get Minimap Location and Size")
-
-        # Update health monitor with current frame
-        self.health_monitor.update_frame(self.img_frame[self.cfg["ui_coords"]["ui_y_start"]:, :])
 
         #################################
         ### Player Location Detection ###
@@ -1713,6 +2500,7 @@ class MapleStoryAutoBot:
         # tag disables combat for this frame; minimap route navigation remains
         # available independently.
         loc_player = self.get_player_location_by_nametag()
+        self.current_nametag_valid = loc_player is not None
 
         # Update player location
         if loc_player is not None:
@@ -1742,6 +2530,7 @@ class MapleStoryAutoBot:
                                 player_hsv=self.cfg["minimap"].get("player_hsv"))
         if loc_player_minimap:
             self.loc_player_minimap = loc_player_minimap
+            self.current_minimap_player_valid = self.current_minimap_roi_valid
         elif self.cfg["bot"].get("route_only"):
             self.pause_for_visual("player_not_visible")
             return -1
@@ -1756,7 +2545,7 @@ class MapleStoryAutoBot:
         #     debug_minimap_colors(self.img_minimap, other_player_color)
 
         # Get player location on global map
-        if self.cfg["bot"]["mode"] in ["patrol", "aux"]:
+        if self.cfg["bot"]["mode"] in ["patrol", "aux", "fixed_platform"]:
             self.loc_player_global = self.loc_player_minimap
         else:
             loc_player_global = self.get_player_location_on_global_map()
@@ -1772,11 +2561,10 @@ class MapleStoryAutoBot:
             self.update_route_only_commands(
                 combat_available=(not route_attack or loc_player is not None)
             )
-            self.draw_combat_ranges_debug()
+            self.draw_route_execution_debug()
             self.kb.set_command(
                 f"{self.cmd_move_x} {self.cmd_move_y} {self.cmd_action}"
             )
-            self.record_monster_frame_pipeline(frame_pipeline_started)
             self.is_first_frame = False
             return 0
 
@@ -1816,10 +2604,10 @@ class MapleStoryAutoBot:
                 self.channel_change()
             elif cfg_action == "go_home":
                 logger.info("[Attack Timeout] Return home!")
-                press_key(self.cfg["key"]["return_home"])
-                # Terminate Autobot
-                self.is_terminated = True
-                self.kb.is_terminated = True
+                self.request_return_home("attack_watchdog")
+                # Do not emit a movement or attack command while the guarded
+                # input worker is preparing the return-home action.
+                return 0
             else:
                 logger.info(f"Unsupported timeout mode: {cfg_action}")
 
@@ -1830,32 +2618,12 @@ class MapleStoryAutoBot:
         ######################
         self.fsm.do_state_stuff()
 
+        if self.img_route_debug is not None:
+            self.draw_route_execution_debug()
+
         self.is_first_frame = False
 
         self.profiler.mark("State per-frame behavior")
-
-        #####################
-        ### Debug Windows ###
-        #####################
-        # Don't show debug window to save system resource
-        if not self.is_show_debug_window:
-            return 0 # frame done
-
-        # Print text on debug image
-        self.update_info_on_img_frame_debug()
-
-        # Resize img_route_debug for better visualization
-        if self.cfg["bot"]["mode"] == "normal":
-            self.img_route_debug = cv2.resize(
-                        self.img_route_debug, (0, 0),
-                        fx=self.cfg["minimap"]["debug_window_upscale"],
-                        fy=self.cfg["minimap"]["debug_window_upscale"],
-                        interpolation=cv2.INTER_NEAREST)
-
-        self.profiler.mark("Debug Window Show")
-
-        # Update FPS timer
-        self.t_last_frame = time.time()
 
         # Print profiler result
         if self.cfg["profiler"]["enable"] and \
@@ -1864,15 +2632,18 @@ class MapleStoryAutoBot:
 
         return 0 # frame done
 
-    def loop(self):
+    def loop(self, run_generation=None):
         '''
         Auto Bot main loop
         Only run when call autobot from UI framework and AutoBotController
         '''
+        if run_generation is None:
+            run_generation = int(getattr(self, "run_generation", 0))
+        runtime_stop_reason = None
         try:
             while not self.kb.is_terminated:
 
-                t_start = time.time()
+                frame_started = time.perf_counter()
 
                 # Process one game window frame
                 self.is_frame_done = False
@@ -1880,24 +2651,44 @@ class MapleStoryAutoBot:
 
                 # Only proceed if the frame is valid
                 if ret == 0:
-                    # Draw image on debug window
-                    if self.is_show_debug_window and self.is_ui:
-                        if self.viz_mode == "game":
-                            img_frame_debug_emit = self.get_frame_debug_for_viz()
-                            if (img_frame_debug_emit is not None and
-                                    self.image_debug_signal is not None):
-                                self.image_debug_signal.emit(img_frame_debug_emit)
-                        elif (self.img_route_debug is not None and
-                              self.route_map_viz_signal is not None):
-                            self.route_map_viz_signal.emit(
-                                self.img_route_debug.copy()
+                    # Control latency excludes optional diagnostic rendering.
+                    self.record_control_frame_pipeline(frame_started)
+
+                    requested_mode = self._frame_visualization_mode
+                    if (self.is_ui and requested_mode in {"game", "route"} and
+                            self.visualization_sink is not None):
+                        compose_started = time.perf_counter()
+                        if requested_mode == "game":
+                            preview = self.get_frame_debug_for_viz()
+                        else:
+                            preview = self.get_route_debug_for_viz()
+                        compose_ms = (
+                            time.perf_counter() - compose_started
+                        ) * 1000.0
+                        self.visualization_compose_times.append(compose_ms)
+
+                        if preview is not None:
+                            publish_started = time.perf_counter()
+                            self.visualization_sink(
+                                requested_mode,
+                                preview,
+                                self.get_visualization_performance(),
                             )
-                        self.t_last_viz_frame = time.time()
+                            self.visualization_publish_times.append(
+                                (time.perf_counter() - publish_started) * 1000.0
+                            )
+                            self.t_last_viz_frame = time.time()
+
+                        # Release the only full-size debug copy immediately.
+                        self.img_frame_debug = None
+                        self.img_route_debug = None
+
+                    self.t_last_frame = time.time()
 
                 self.is_frame_done = True
 
                 # Cap FPS to save system resource
-                frame_duration = time.time() - t_start
+                frame_duration = time.perf_counter() - frame_started
                 target_duration = 1.0 / RUNTIME_POLICY.main_fps
                 if frame_duration < target_duration:
                     time.sleep(target_duration - frame_duration)
@@ -1906,12 +2697,17 @@ class MapleStoryAutoBot:
             # deliberately synchronous: command TTL is a second line of
             # defense, not a substitute for immediately releasing held keys.
             logger.error(f"[MapleStoryAutoBot] Main loop failed closed: {exc}")
+            if not self.is_terminated:
+                runtime_stop_reason = "engine_error"
             try:
                 self.kb.set_command("stop stop none")
             except Exception as command_exc:
                 logger.error(f"[MapleStoryAutoBot] Failed to set stop command: {command_exc}")
-            self.kb.is_terminated = True
-            self.kb.release_all_key()
+            if hasattr(self.kb, "terminate"):
+                self.kb.terminate()
+            else:
+                self.kb.is_terminated = True
+                self.kb.release_all_key()
             try:
                 self.capture.stop()
             except Exception as capture_exc:
@@ -1920,9 +2716,41 @@ class MapleStoryAutoBot:
                 self.health_monitor.stop()
             except Exception as health_exc:
                 logger.error(f"[MapleStoryAutoBot] Failed to stop health monitor: {health_exc}")
+            self.is_terminated = True
         finally:
             self.is_frame_done = True
             self.kb.release_all_key()
+            if self.kb.is_terminated and not getattr(self, "is_terminated", False):
+                runtime_stop_reason = (
+                    getattr(self.kb, "termination_reason", "") or
+                    "input_stopped"
+                )
+                try:
+                    if self.health_monitor is not None:
+                        self.health_monitor.stop()
+                except Exception as health_exc:
+                    logger.error(
+                        "[MapleStoryAutoBot] Failed to stop health monitor: "
+                        f"{health_exc}"
+                    )
+                try:
+                    if self.capture is not None:
+                        self.capture.stop()
+                except Exception as capture_exc:
+                    logger.error(
+                        "[MapleStoryAutoBot] Failed to stop capture: "
+                        f"{capture_exc}"
+                    )
+                self.is_terminated = True
+            termination_sink = getattr(self, "termination_sink", None)
+            if runtime_stop_reason is not None and termination_sink is not None:
+                try:
+                    termination_sink(run_generation, runtime_stop_reason)
+                except Exception as notify_exc:
+                    logger.error(
+                        "[MapleStoryAutoBot] Failed to notify runtime stop: "
+                        f"{notify_exc}"
+                    )
 
 def main(args):
     '''
@@ -1950,9 +2778,9 @@ def main(args):
     if is_mac():
         cfg = override_cfg(cfg, load_yaml("config/config_macOS.yaml"))
     # Override with user customized config
-    custom_cfg = validate_custom_config(
+    custom_cfg = migrate_health_monitor_config(validate_custom_config(
         load_yaml(f"config/config_{args.cfg}.yaml")
-    )
+    ))
     cfg = override_cfg(cfg, custom_cfg)
     # Dump config to log for debugging
     logger.debug(yaml.dump(cfg, sort_keys=False,
@@ -1997,7 +2825,9 @@ def main(args):
                     cv2.imshow("Game Window Debug", img_frame_debug_viz)
 
             if mapleStoryAutoBot.img_route_debug is not None:
-                cv2.imshow("Route Map Debug", mapleStoryAutoBot.img_route_debug)
+                route_debug_viz = mapleStoryAutoBot.get_route_debug_for_viz()
+                if route_debug_viz is not None:
+                    cv2.imshow("Route Map Debug", route_debug_viz)
 
             cv2.waitKey(1)
 

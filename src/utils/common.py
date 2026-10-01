@@ -3,9 +3,11 @@ Utility functions
 '''
 # Standard Import
 import cv2
+import copy
 import datetime
 import os
 import platform
+import tempfile
 from collections import defaultdict
 import time
 
@@ -67,9 +69,40 @@ def load_yaml_with_comments(path):
     return data, dict(field_comments), section_comments
 
 def save_yaml(data, path):
+    """Serialize YAML completely before atomically replacing *path*.
+
+    The main window and a second accidentally opened instance can save the
+    shared runtime snapshot at nearly the same time.  Writing the destination
+    directly lets another process parse a truncated document.  A same-folder
+    temporary file plus ``os.replace`` keeps every observable version whole.
+    """
     data = convert_tuples_to_lists(data)
-    with open(path, 'w', encoding='utf-8') as f:
-        yaml.dump(data, f, default_flow_style=False)
+    target = os.fspath(path)
+    parent = os.path.dirname(os.path.abspath(target))
+    os.makedirs(parent, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=parent
+    )
+    try:
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as f:
+            yaml.dump(data, f, default_flow_style=False)
+            f.flush()
+            os.fsync(f.fileno())
+        # Validate exactly what will become visible.  A serialization failure
+        # therefore leaves the previous configuration untouched.
+        with open(temporary, 'r', encoding='utf-8') as f:
+            yaml.safe_load(f)
+        for attempt in range(3):
+            try:
+                os.replace(temporary, target)
+                break
+            except PermissionError:
+                if attempt == 2:
+                    raise
+                time.sleep(0.02)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
     logger.info(f"Save yaml: {path}")
 
 def get_cfg_diff(base, current):
@@ -91,6 +124,33 @@ def get_cfg_diff(base, current):
             if norm_current != norm_base:
                 diff[key] = current[key]
     return diff
+
+
+def retain_explicit_config_values(diff, current, explicit):
+    """Keep fields that the loaded profile deliberately declared.
+
+    ``get_cfg_diff`` omits values equal to the generic defaults.  Some client
+    profiles still need those values written explicitly as part of their
+    contract (for example the classic client's jump key).  Removed/migrated
+    fields are not restored because they no longer exist in ``current``.
+    """
+    result = copy.deepcopy(diff)
+    if not isinstance(current, dict) or not isinstance(explicit, dict):
+        return result
+    for key, explicit_value in explicit.items():
+        if key not in current:
+            continue
+        current_value = current[key]
+        if isinstance(explicit_value, dict) and isinstance(current_value, dict):
+            child = result.get(key, {})
+            result[key] = retain_explicit_config_values(
+                child, current_value, explicit_value
+            )
+            if not result[key]:
+                result.pop(key, None)
+        else:
+            result[key] = copy.deepcopy(current_value)
+    return result
 
 def normalize(value):
     """
@@ -148,8 +208,15 @@ def load_image(path, mode=cv2.IMREAD_COLOR):
         logger.error(f"Image not found: {path}")
         raise FileNotFoundError(f"Image not found: {path}")
 
-    # Load image
-    img = cv2.imread(path, mode)
+    # ``cv2.imread`` is not reliable for non-ASCII Windows paths. Reading the
+    # bytes through NumPy and decoding them keeps Chinese map/profile names
+    # working without changing callers or image ownership.
+    try:
+        encoded = np.fromfile(path, dtype=np.uint8)
+    except OSError as exc:
+        logger.error(f"Failed to read image file: {path}: {exc}")
+        raise ValueError(f"Failed to load image: {path}") from exc
+    img = cv2.imdecode(encoded, mode) if encoded.size else None
     if img is None:
         logger.error(f"Failed to load image file: {path}")
         raise ValueError(f"Failed to load image: {path}")
@@ -407,17 +474,9 @@ def get_minimap_loc_size(img_frame, cfg=None):
     if cfg is not None:
         normalized = cfg.get("minimap", {}).get("roi")
         if normalized:
-            if len(normalized) != 4:
-                raise ValueError("minimap.roi must contain x, y, width, height")
+            from src.engine.MapProjectConfig import normalized_roi_to_pixels
             height, width = img_frame.shape[:2]
-            nx, ny, nw, nh = (float(value) for value in normalized)
-            left = max(0, min(round(nx * width), width))
-            top = max(0, min(round(ny * height), height))
-            right = max(left, min(round((nx + nw) * width), width))
-            bottom = max(top, min(round((ny + nh) * height), height))
-            if right <= left or bottom <= top:
-                return None
-            return left, top, right - left, bottom - top
+            return normalized_roi_to_pixels(normalized, width, height)
 
     white = np.array([255, 255, 255])
 
@@ -527,7 +586,8 @@ def get_player_location_on_minimap(
         cx, cy = centroids[index]
         return int(round(cx)), int(round(cy))
 
-    mask = cv2.inRange(img_minimap, minimap_player_color, minimap_player_color)
+    exact_color = np.asarray(minimap_player_color, dtype=np.uint8)
+    mask = cv2.inRange(img_minimap, exact_color, exact_color)
     coords = cv2.findNonZero(mask)
     if coords is None or len(coords) < 4:
         return None
@@ -566,7 +626,10 @@ def prepare_game_frame(frame, cfg):
     if game_window.get("resize_on_start", True):
         return cv2.resize(frame_no_title, WINDOW_WORKING_SIZE,
                           interpolation=cv2.INTER_NEAREST)
-    return frame_no_title.copy()
+    # The capture object owns this frame until the next get_frame() call.  A
+    # view is sufficient for the synchronous control pass and avoids copying
+    # the complete client when no resize is requested.
+    return frame_no_title
 
 def get_all_other_player_locations_on_minimap(img_minimap, red_bgr=(0, 0, 255)):
     '''
@@ -825,10 +888,16 @@ def get_game_window_title_by_token(token):
     '''
     Only work in Windows OS
     '''
+    target = get_game_window_target_by_token(token)
+    return target[1] if target is not None else None
+
+
+def get_game_window_target_by_token(token):
+    """Return the HWND and exact title from one Windows enumeration pass."""
     def callback(hwnd, matches):
         title = win32gui.GetWindowText(hwnd)
         if token.lower() in title.lower():
-            matches.append(title)
+            matches.append((int(hwnd), title))
     matches = []
     win32gui.EnumWindows(callback, matches)
     return matches[0] if matches else None

@@ -7,6 +7,8 @@ import cv2
 import numpy as np
 import yaml
 
+from src.engine.NameTagProfileRepository import load_bgr_image
+
 
 @dataclass(frozen=True)
 class NameTagResult:
@@ -68,9 +70,7 @@ class NameTagLocalizer:
         for entry in profile.get("samples", []):
             if not entry.get("enabled", True):
                 continue
-            image = cv2.imread(str(profile_dir / entry["file"]), cv2.IMREAD_COLOR)
-            if image is None:
-                raise ValueError(f"Unable to load name-tag sample: {entry['file']}")
+            image = load_bgr_image(profile_dir / entry["file"])
             samples.append((image, tuple(int(v) for v in entry["player_offset"])))
         settings = dict(profile.get("settings", {}))
         settings.update(overrides)
@@ -132,6 +132,44 @@ class NameTagLocalizer:
                 matches.append((score, index, point))
         return min(matches) if matches else None
 
+    @staticmethod
+    def _prepare_search(frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        text = cv2.inRange(
+            hsv, np.array([0, 0, 120]), np.array([179, 90, 255])
+        )
+        return gray, text
+
+    def _best_local_match(self, frame):
+        """Preprocess only the union of the existing per-template search ROIs."""
+        if self.last_tag is None:
+            return None
+        x, y = self.last_tag
+        radius = self.local_search_radius
+        max_h = max(sample.gray.shape[0] for sample in self.samples)
+        max_w = max(sample.gray.shape[1] for sample in self.samples)
+        x0, y0 = max(0, x - radius), max(0, y - radius)
+        x1 = min(frame.shape[1], x + radius + max_w)
+        y1 = min(frame.shape[0], y + radius + max_h)
+        gray, text = self._prepare_search(frame[y0:y1, x0:x1])
+
+        matches = []
+        for index, sample in enumerate(self.samples):
+            h, w = sample.gray.shape[:2]
+            sample_x1 = min(frame.shape[1], x + radius + w) - x0
+            sample_y1 = min(frame.shape[0], y + radius + h) - y0
+            match = self._match_sample(
+                gray[:sample_y1, :sample_x1],
+                text[:sample_y1, :sample_x1],
+                sample,
+                origin=(x0, y0),
+            )
+            if match is not None:
+                point, score = match
+                matches.append((score, index, point))
+        return min(matches) if matches else None
+
     def _invalid(self, reason, score=1.0):
         self.missed_frames += 1
         if self.missed_frames > self.max_missed_frames:
@@ -145,15 +183,17 @@ class NameTagLocalizer:
             return self._invalid("frame_invalid")
         if y_limit is not None:
             frame = frame[:max(1, min(frame.shape[0], int(y_limit))), :]
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        text = cv2.inRange(hsv, np.array([0, 0, 120]), np.array([179, 90, 255]))
 
         use_local = (self.last_tag is not None and
                      self.frame_index % self.global_refresh_frames != 0)
-        best = self._best_match(gray, text, local_only=use_local)
+        if use_local:
+            best = self._best_local_match(frame)
+        else:
+            gray, text = self._prepare_search(frame)
+            best = self._best_match(gray, text, local_only=False)
         if best is None or best[0] > self.max_score:
             if use_local:
+                gray, text = self._prepare_search(frame)
                 best = self._best_match(gray, text, local_only=False)
             if best is None or best[0] > self.max_score:
                 return self._invalid("not_found", 1.0 if best is None else best[0])

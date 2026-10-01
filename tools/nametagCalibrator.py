@@ -2,11 +2,9 @@
 
 import argparse
 import time
-from pathlib import Path
-
 import cv2
-import yaml
 
+from src.engine.NameTagProfileRepository import NameTagProfileRepository
 from src.input.GameWindowCapturor import GameWindowCapturor
 from src.utils.common import is_mac, load_yaml, override_cfg, prepare_game_frame
 
@@ -54,39 +52,13 @@ def _save_sample(profile_name, frame, rect, foot, scale_x, scale_y):
     if crop.size == 0 or crop.shape[0] < 5 or crop.shape[1] < 5:
         raise ValueError("Selected name-tag rectangle is too small")
 
-    profile_dir = Path("nametag") / profile_name
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    profile_path = profile_dir / "profile.yaml"
-    if profile_path.exists():
-        with profile_path.open("r", encoding="utf-8") as stream:
-            profile = yaml.safe_load(stream) or {}
-    else:
-        profile = {
-            "schema_version": 1,
-            "settings": {
-                "max_score": 0.30,
-                "local_search_radius": 140,
-                "global_refresh_frames": 30,
-                "max_jump": 250,
-                "jump_confirm_frames": 2,
-                "jump_confirm_radius": 25,
-                "max_missed_frames": 5,
-                "edge_weight": 0.65,
-            },
-            "samples": [],
-        }
-
-    sample_name = f"sample_{len(profile.get('samples', [])) + 1:03d}.png"
-    if not cv2.imwrite(str(profile_dir / sample_name), crop):
-        raise OSError(f"Unable to save {sample_name}")
-    profile.setdefault("samples", []).append({
-        "file": sample_name,
-        "player_offset": [foot_x - px0, foot_y - py0],
-        "enabled": True,
-    })
-    with profile_path.open("w", encoding="utf-8") as stream:
-        yaml.safe_dump(profile, stream, allow_unicode=True, sort_keys=False)
-    return profile_path, sample_name, (foot_x - px0, foot_y - py0)
+    repository = NameTagProfileRepository()
+    exists = profile_name in repository.list_profiles()
+    stage = repository.create_stage(profile_name, existing=exists)
+    offset = (foot_x - px0, foot_y - py0)
+    sample_name = repository.stage_sample(stage, crop, offset, enabled=True)
+    profile_dir = repository.commit_profile(stage, require_enabled=True)
+    return profile_dir / "profile.yaml", sample_name, offset
 
 
 def main(args):

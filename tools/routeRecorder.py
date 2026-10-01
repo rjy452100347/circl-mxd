@@ -431,7 +431,9 @@ class RouteRecorder():
         action = ""
         is_draw_blob = False
         key_press = self.kb.key_pressing
-        if "space" in key_press:
+        jump_key = str(self.cfg["key"].get("jump", "")).lower()
+        teleport_key = str(self.cfg["key"].get("teleport", "")).lower()
+        if jump_key and jump_key in key_press:
             if "left" in key_press:
                 action = "left none jump"
             elif "right" in key_press:
@@ -441,7 +443,7 @@ class RouteRecorder():
             else:
                 action = "none none jump"
             is_draw_blob = True
-        elif self.cfg["key"].get("teleport") and "e" in key_press: # Teleport skill
+        elif teleport_key and teleport_key in key_press: # Teleport skill
             if "left" in key_press:
                 action = "left none teleport"
             elif "right" in key_press:
@@ -484,7 +486,7 @@ class RouteRecorder():
             # Draw a line from the last position to the current one (if available)
             px, py = self.loc_player_global
             if is_draw_blob:
-                event_key = "space" if action.endswith("jump") else "e"
+                event_key = jump_key if action.endswith("jump") else teleport_key
                 if action == "none none goal" or event_key not in self.previous_key_press:
                     # Draw a small filled circle at current position
                     cv2.circle(self.img_route,

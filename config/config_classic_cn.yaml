@@ -1,5 +1,6 @@
 bot:
   map: newcomer_training_ground_1
+  mode: fixed_platform
   route_attack: true
   route_only: true
 directional_attack:
@@ -25,14 +26,14 @@ game_window:
 health_monitor:
   add_hp_percent: 60
   add_mp_percent: 0
-  enable: false
+  auto_mp_enabled: false
 key:
   add_hp: f
   aoe_skill: '1'
   directional_attack: q
-  jump: '1'
+  jump: space
   return_home: '2'
-  teleport: '2'
+  teleport: ''
 minimap:
   player_hsv:
     lower:
@@ -48,6 +49,9 @@ minimap:
   - 0.0902777778
   - 0.1078574915
   - 0.1623263889
+monster_detect:
+  yolo_confidence: 0.7
+  yolo_min_monster_box_side: 15
 route:
   event_rearm_distance: 5
   localization_max_score: 0.2

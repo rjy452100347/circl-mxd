@@ -29,6 +29,7 @@ def test_current_client_frame_is_not_cropped_or_resized():
 
     assert prepared.shape == (1152, 2049, 3)
     assert prepared is not frame
+    assert np.shares_memory(prepared, frame)
 
 
 def test_current_client_wrong_size_is_rejected():

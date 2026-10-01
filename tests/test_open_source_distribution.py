@@ -2,6 +2,7 @@ import inspect
 from pathlib import Path
 import subprocess
 
+import pytest
 import yaml
 
 from src.engine.MapleStoryAutoLevelUp import MapleStoryAutoBot
@@ -45,7 +46,11 @@ def test_distribution_contains_no_runtime_image_or_model_assets():
         ".bin", ".bmp", ".gif", ".ico", ".jpeg", ".jpg", ".onnx",
         ".pem", ".pfx", ".png", ".pt", ".pth",
     }
-    found = [path for path in tracked if path.suffix.lower() in forbidden_suffixes]
+    found = [
+        path for path in tracked
+        if path.suffix.lower() in forbidden_suffixes
+        and not (path.parts[0] == "docs" and path.suffix.lower() == ".gif")
+    ]
     assert found == []
 
 
@@ -55,6 +60,11 @@ def test_default_deployment_path_is_portable():
     )
     assert "deployment/openvino_cpu_2class" in config
     assert ":/MapleStoryAssets" not in config
+    classic = (ROOT / "config" / "config_classic_cn.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "warrior_v3_openvino_int8" not in classic
+    assert "N:/Program Files" not in classic
 
 
 def test_missing_map_asset_fails_closed(tmp_path, monkeypatch):
@@ -66,4 +76,5 @@ def test_missing_map_asset_fails_closed(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
 
     bot = MapleStoryAutoBot.__new__(MapleStoryAutoBot)
-    assert bot.load_config(config) == -1
+    with pytest.raises(FileNotFoundError, match="minimaps/not_installed/map.png"):
+        bot.load_config(config)

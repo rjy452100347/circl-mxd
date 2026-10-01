@@ -148,7 +148,9 @@ class QtLogHandler(logging.Handler, QObject):
         msg = self.format(record)
         self.log_signal.emit(msg, record.levelno)
 
-def create_advance_setting_gbox(title, cfg, comments=None, comments_section=None):
+def create_advance_setting_gbox(
+    title, cfg, comments=None, comments_section=None, hidden_keys=()
+):
     gbox = QGroupBox(section_label(title))
     form_layout = QFormLayout()
     gbox._field_refs = {}
@@ -235,7 +237,10 @@ def create_advance_setting_gbox(title, cfg, comments=None, comments_section=None
                 form_layout.addRow(QLabel(field_label(key)), line)
                 gbox._field_refs[key] = line
 
+    hidden_keys = frozenset(hidden_keys)
     for key, value in cfg[title].items():
+        if key in hidden_keys:
+            continue
         add_field(key, value)
 
     gbox.setLayout(form_layout)

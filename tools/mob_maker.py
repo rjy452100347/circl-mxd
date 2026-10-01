@@ -1,11 +1,10 @@
+import requests
 import json
 import zipfile
 import io
 import cv2
 import numpy as np
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import urlopen
 
 # Assuming a base URL for the API. In a real application, this would be in a config file.
 BASE_URL = "https://maplestory.io" # Placeholder URL, replace with actual API base URL
@@ -34,15 +33,20 @@ def get_all_mobs(region=None, version=None):
     print(f"Fetching mobs from: {url}\nYou can find monster names at https://maplestory.wiki/GMS/65/mob")
 
     try:
-        with urlopen(url, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
+        response = requests.get(url)
+        response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
+        return response.json()
     
-    except HTTPError as http_err:
+    except requests.exceptions.HTTPError as http_err:
         print(f"HTTP error occurred: {http_err}")
-    except URLError as conn_err:
+    except requests.exceptions.ConnectionError as conn_err:
         print(f"Connection error occurred: {conn_err}")
-    except (TimeoutError, json.JSONDecodeError) as req_err:
-        print(f"Failed to fetch or decode JSON: {req_err}")
+    except requests.exceptions.Timeout as timeout_err:
+        print(f"Timeout error occurred: {timeout_err}")
+    except requests.exceptions.RequestException as req_err:
+        print(f"An unexpected error occurred: {req_err}")
+    except json.JSONDecodeError:
+        print(f"Failed to decode JSON from response: {response.text}")
     return None
 
 def find_mob_id(all_mobs, mob_name):
@@ -63,8 +67,13 @@ def save_mob(mob_id, folder="monster", mob_name="mob"):
     download_url = f"{BASE_URL}/api/{DEFAULT_REGION}/{DEFAULT_VERSION}/mob/{mob_id}/download"
 
     try:
-        with urlopen(download_url, timeout=60) as response:
-            zip_bytes = io.BytesIO(response.read())
+        # Send HTTP GET request to download the zip file content
+        response = requests.get(download_url)
+        # Raise exception if HTTP request returned an unsuccessful status code
+        response.raise_for_status()
+
+        # Create a BytesIO stream from the downloaded zip file bytes (in-memory file)
+        zip_bytes = io.BytesIO(response.content)
 
         # Open the zip file from the in-memory bytes
         with zipfile.ZipFile(zip_bytes) as zip_file:

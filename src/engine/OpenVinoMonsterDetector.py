@@ -11,6 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
+
 MODEL_WIDTH = 1280
 MODEL_HEIGHT = 224
 MODEL_CLASS_NAMES = {0: "monster", 1: "player"}
@@ -90,12 +91,33 @@ class OpenVinoMonsterDetector:
         deployment_root,
         *,
         confidence=0.25,
+        min_monster_box_side=10,
+        player_exclusion_width=80,
+        player_exclusion_height=100,
         max_det=50,
         variant="auto",
         runtime_factory=None,
     ):
         self.root = Path(deployment_root).expanduser().resolve()
         self.confidence = float(confidence)
+        try:
+            min_box_side_value = float(min_monster_box_side)
+        except (TypeError, ValueError) as exc:
+            raise OpenVinoDeploymentError(
+                f"YOLO 怪物框最小边长必须是 0–{MODEL_HEIGHT} 之间的整数。"
+            ) from exc
+        if (not math.isfinite(min_box_side_value) or
+                not min_box_side_value.is_integer()):
+            raise OpenVinoDeploymentError(
+                f"YOLO 怪物框最小边长必须是 0–{MODEL_HEIGHT} 之间的整数。"
+            )
+        self.min_monster_box_side = int(min_box_side_value)
+        self.player_exclusion_width = self._parse_exclusion_dimension(
+            player_exclusion_width, MODEL_WIDTH, "宽度"
+        )
+        self.player_exclusion_height = self._parse_exclusion_dimension(
+            player_exclusion_height, MODEL_HEIGHT, "高度"
+        )
         self.max_det = int(max_det)
         requested_variant = str(variant).strip().lower()
         if requested_variant not in {"auto", "fp16", "int8", "int8_v2"}:
@@ -104,18 +126,19 @@ class OpenVinoMonsterDetector:
             )
         if not 0.05 <= self.confidence <= 0.95:
             raise OpenVinoDeploymentError("YOLO 置信度必须在 0.05–0.95 之间。")
+        if not 0 <= self.min_monster_box_side <= MODEL_HEIGHT:
+            raise OpenVinoDeploymentError(
+                f"YOLO 怪物框最小边长必须是 0–{MODEL_HEIGHT} 之间的整数。"
+            )
         if self.max_det != 50:
             raise OpenVinoDeploymentError("当前双类部署要求 yolo_max_det 固定为 50。")
 
         self.manifest = self._validate_deployment(requested_variant)
         factory = runtime_factory or _load_runtime_class(self.root)
         try:
-            self.runtime = factory(
-                self.root,
-                confidence=self.confidence,
-                max_det=self.max_det,
-                variant=self.variant,
-            )
+            kwargs = {"confidence": self.confidence, "max_det": self.max_det}
+            kwargs["variant"] = self.variant
+            self.runtime = factory(self.root, **kwargs)
         except OpenVinoDeploymentError:
             raise
         except Exception as exc:
@@ -126,6 +149,48 @@ class OpenVinoMonsterDetector:
         self.last_visible_rect = (0, 0, 0, 0)
         self.last_players = []
         self.last_player_foot = None
+
+    @staticmethod
+    def _parse_exclusion_dimension(value, maximum, label):
+        try:
+            number = float(value)
+        except (TypeError, ValueError) as exc:
+            raise OpenVinoDeploymentError(
+                f"YOLO 人物排除区{label}必须是 0–{maximum} px 之间的整数。"
+            ) from exc
+        if (not math.isfinite(number) or not number.is_integer() or
+                not 0 <= number <= maximum):
+            raise OpenVinoDeploymentError(
+                f"YOLO 人物排除区{label}必须是 0–{maximum} px 之间的整数。"
+            )
+        return int(number)
+
+    def player_exclusion_rect(self, frame_shape, anchor):
+        """Return the clipped player exclusion rectangle in frame coordinates."""
+        if (anchor is None or self.player_exclusion_width == 0 or
+                self.player_exclusion_height == 0 or len(frame_shape) < 2):
+            return None
+        frame_height, frame_width = map(int, frame_shape[:2])
+        if frame_width <= 0 or frame_height <= 0:
+            return None
+        try:
+            player_x, player_y = map(float, anchor)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(player_x) or not math.isfinite(player_y):
+            return None
+        half_width = self.player_exclusion_width / 2.0
+        x0 = max(0, min(frame_width - 1, math.floor(player_x - half_width)))
+        x1 = max(0, min(frame_width - 1, math.ceil(player_x + half_width)))
+        y0 = max(
+            0,
+            min(frame_height - 1, math.floor(
+                player_y - self.player_exclusion_height
+            )),
+        )
+        y1 = max(0, min(frame_height - 1, math.ceil(player_y)))
+        return (x0, y0, x1, y1)
+
 
     def _validate_deployment(self, requested_variant="auto"):
         manifest_path = self.root / "manifest.json"
@@ -241,7 +306,7 @@ class OpenVinoMonsterDetector:
                 frame[src_y0:src_y1, src_x0:src_x1]
         return np.ascontiguousarray(crop), (desired_x0, desired_y0), visible
 
-    def detect(self, frame, player_foot):
+    def detect(self, frame, player_foot, *, player_exclusion_anchor=None):
         total_start = time.perf_counter()
         crop_start = total_start
         image, origin, visible = self.crop_input(frame, player_foot)
@@ -254,6 +319,9 @@ class OpenVinoMonsterDetector:
         convert_start = infer_end
         frame_height, frame_width = frame.shape[:2]
         origin_x, origin_y = origin
+        exclusion_rect = self.player_exclusion_rect(
+            frame.shape, player_exclusion_anchor
+        )
         monsters = []
         players = []
         for detection in predictions:
@@ -273,10 +341,22 @@ class OpenVinoMonsterDetector:
             y2 = max(0, min(frame_height, math.ceil(values[3] + origin_y)))
             if x2 <= x1 or y2 <= y1:
                 continue
+            width = x2 - x1
+            height = y2 - y1
+            if (class_id == 0 and
+                    min(width, height) < self.min_monster_box_side):
+                continue
+            if class_id == 0 and exclusion_rect is not None:
+                center_x = (x1 + x2) / 2.0
+                center_y = (y1 + y2) / 2.0
+                exclude_x0, exclude_y0, exclude_x1, exclude_y1 = exclusion_rect
+                if (exclude_x0 <= center_x <= exclude_x1 and
+                        exclude_y0 <= center_y <= exclude_y1):
+                    continue
             item = {
                 "name": MODEL_CLASS_NAMES[class_id],
                 "position": (x1, y1),
-                "size": (x2 - x1, y2 - y1),
+                "size": (width, height),
                 "confidence": confidence,
                 "score": 1.0 - confidence,
                 "class_id": class_id,
